@@ -1,6 +1,7 @@
 # worker/app.py
 import os
 from typing import List, Optional, Dict, Any
+import traceback
 
 import torch
 from fastapi import FastAPI, HTTPException, Body
@@ -207,18 +208,19 @@ def embed(body: Dict[str, Any] = Body(...)):
                 raise HTTPException(400, f"item[{i}] must provide image_url/image_path and/or text")
 
             try:
-                if img_ref and (txt is not None):
-                    img = _load_image_from_ref(img_ref)
-                    vec = _model.encode(images=img, text=txt)
-                elif img_ref:
-                    img = _load_image_from_ref(img_ref)
-                    vec = _model.encode(images=img)
+                # 关键点：不要用 PIL，直接把字符串传给模型；
+                # 且当同时传图文时，images 和 text 都用同一种“标量类型 str”
+                if img_ref is not None and txt is not None:
+                    vec = _model.encode(images=img_ref, text=txt)
+                elif img_ref is not None:
+                    vec = _model.encode(images=img_ref)
                 else:
                     vec = _model.encode(text=txt)
             except HTTPException:
                 raise
             except Exception as e:
-                raise HTTPException(500, f"encode failed on item[{i}]: {e}")
+                import traceback
+                raise HTTPException(500, f"encode failed on item[{i}]: {e}\n{traceback.format_exc()}")
 
             if isinstance(vec, torch.Tensor):
                 vec = vec.detach().to("cpu")

@@ -1,5 +1,5 @@
 # Dockerfile
-FROM FROM python:3.12-slim
+FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \

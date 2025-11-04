@@ -11,5 +11,6 @@ docker run -dit \
   -e MODEL_PORT_BASE=18008 \
   -e PYTHON_BIN=python3 \
   -v /home/jhu/dev/models/embs:/root/models \
+  -v /home/jhu/dev/media:/root/media \
   -v /etc/localtime:/etc/localtime:ro \
   emb_server

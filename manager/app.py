@@ -147,7 +147,10 @@ def embed(model: str, body: dict = Body(...)):
     try:
         r = requests.post(f"http://127.0.0.1:{w.port}/embed", json=body, timeout=120)
         w.last_used = time.time()
-        r.raise_for_status()  # 将 worker 的错误显式抛出
+        # r.raise_for_status()  # 将 worker 的错误显式抛出
+        if r.status_code >= 400:
+            # 把 worker 返回的具体错误正文带出来，便于定位
+            raise HTTPException(r.status_code, f"worker@{w.port} -> {r.text}")
         return r.json()
     finally:
         w.inflight -= 1
