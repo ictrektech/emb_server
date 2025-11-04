@@ -70,6 +70,7 @@ fi
 
 
 # 构建并推送镜像
-docker build -t swr.cn-southwest-2.myhuaweicloud.com/ictrek/${IMG_NAME}:${TAG} -f $PROFILE .
+docker build -t emb_server -f $PROFILE .
+docker tag emb_server swr.cn-southwest-2.myhuaweicloud.com/ictrek/${IMG_NAME}:${TAG}
 
 docker push swr.cn-southwest-2.myhuaweicloud.com/ictrek/${IMG_NAME}:${TAG}

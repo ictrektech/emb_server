@@ -1,5 +1,5 @@
 # Dockerfile
-FROM FROM python:3.12-slim
+FROM dustynv/l4t-pytorch:r36.4.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -15,10 +15,18 @@ RUN chmod 1777 /tmp && apt-get update && apt-get install -y \
 RUN apt-get update && apt-get install -y python3 python3-pip git ffmpeg libglib2.0-0 libsm6 libxrender1 libxext6 && \
     ln -s /usr/bin/python3 /usr/bin/python
 
-RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple
-RUN pip3 config set install.trusted-host mirrors.aliyun.com
-RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+# RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple
+# RUN pip3 config set install.trusted-host mirrors.aliyun.com
+# RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
 RUN pip3 install -U --no-cache-dir transformers FlagEmbedding uvicorn fastapi
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple && \
+    pip config set install.trusted-host mirrors.aliyun.com && \
+    pip install --no-cache-dir transformers FlagEmbedding uvicorn fastapi --index-url https://mirrors.aliyun.com/pypi/simple \
+    --trusted-host mirrors.aliyun.com/pypi/simple \
+    --timeout 120 --retries 5 \
+    --upgrade-strategy only-if-needed \
+    --break-system-packages
+
 
 WORKDIR /app
 COPY manager/ /app/manager/
