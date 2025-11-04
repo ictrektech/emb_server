@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  embd-gateway:
+    build: .
+    image: embd-on-demand:latest
+    ports:
+      - "18000:18000"
+    environment:
+      - MAX_WORKERS=3           # 全局最大并发 Worker 数
+      - PER_MODEL_MAX=2         # 每模型最大副本
+      - IDLE_TIMEOUT_S=900      # 空闲 15 分钟回收
+      - MODEL_PORT_BASE=7000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]  # 需要 Docker 的 NVIDIA 运行时
+    runtime: nvidia
