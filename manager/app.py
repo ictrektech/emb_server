@@ -5,6 +5,7 @@ import subprocess
 import requests
 from typing import Dict, List
 import threading
+from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
@@ -40,6 +41,8 @@ class Worker:
 
 workers: Dict[str, List[Worker]] = {}   # model -> [Worker,...]
 port_alloc = set()
+model_locks = defaultdict(threading.Lock)  # 每个模型一个锁
+start_events: Dict[str, threading.Event] = {}  # 冷启动进行中的事件
 
 app = FastAPI()
 
@@ -81,24 +84,81 @@ def spawn_worker(model: str) -> Worker:
     env["MODEL_NAME"] = model
     env["PORT"] = str(port)
 
-    # 用 uvicorn 起 Worker：worker.app:app
-    proc = subprocess.Popen(
-        [PYTHON_BIN, "-m", "uvicorn", "worker.app:app", "--host", "127.0.0.1", "--port", str(port)],
-        env=env
-    )
+    proc = None
+    try:
+        # 启动 worker
+        proc = subprocess.Popen(
+            [PYTHON_BIN, "-m", "uvicorn", "worker.app:app", "--host", "127.0.0.1", "--port", str(port)],
+            env=env
+        )
 
-    w = Worker(model, port, proc)
-    workers.setdefault(model, []).append(w)
-    wait_healthy(w)
-    return w
+        # 注册 worker
+        w = Worker(model, port, proc)
+        workers.setdefault(model, []).append(w)
+
+        # 等健康
+        wait_healthy(w)
+        return w
+
+    except Exception as e:
+        # === 关键：失败要清理 ===
+        try:
+            if proc is not None:
+                proc.terminate()
+        except Exception:
+            pass
+
+        # 从 worker 表删除
+        if model in workers:
+            workers[model] = [x for x in workers[model] if x.port != port]
+            if not workers[model]:
+                workers.pop(model, None)
+
+        # 端口释放
+        port_alloc.discard(port)
+
+        # 抛出错误
+        raise HTTPException(503, f"Failed to spawn worker for {model}: {e}")
 
 def pick_worker(model: str) -> Worker:
+    # 先看有没有可用实例
     arr = workers.get(model, [])
     if arr:
-        # 简单负载均衡：优先 inflight 小的、最近使用的
         arr = sorted(arr, key=lambda x: (x.inflight, -x.last_used))
         return arr[0]
-    return spawn_worker(model)
+
+    # 没有 → 串行化冷启动
+    lock = model_locks[model]
+    with lock:
+        # 二次检查（可能在等锁时已被别人拉起）
+        arr = workers.get(model, [])
+        if arr:
+            arr = sorted(arr, key=lambda x: (x.inflight, -x.last_used))
+            return arr[0]
+
+        # 若没人启动，当前线程成为“发起者”
+        ev = start_events.get(model)
+        if ev is None:
+            ev = threading.Event()
+            start_events[model] = ev
+            try:
+                w = spawn_worker(model)
+                return w
+            finally:
+                # 无论成功/失败，都要释放等待者
+                ev.set()
+                start_events.pop(model, None)
+        else:
+            # 已有发起者在启动，当前线程等待结果
+            # 超时时间与 wait_healthy 对齐或略大
+            ev.wait(timeout=90)
+
+            arr = workers.get(model, [])
+            if not arr:
+                # 冷启动失败，给出“正在预热失败”的 503，比 500 友好
+                raise HTTPException(503, f"{model} is warming up but failed to be ready; please retry")
+            arr = sorted(arr, key=lambda x: (x.inflight, -x.last_used))
+            return arr[0]
 
 def evict_idle():
     # 先找空闲超时的
