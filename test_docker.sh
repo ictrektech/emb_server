@@ -1,7 +1,13 @@
 #!/bin/bash
+
+GPU_FLAG=""
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+  GPU_FLAG="--gpus all"
+fi
+
 docker run -dit \
   --name emb \
-  --gpus all \
+  $GPU_FLAG \
   -p 18000:18000 \
   -e TRANSFORMERS_OFFLINE=1 \
   -e HF_DATASETS_OFFLINE=1 \
