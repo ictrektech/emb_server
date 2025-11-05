@@ -271,22 +271,40 @@ def embed(body: Dict[str, Any] = Body(...)):
             if not img_ref and txt is None:
                 raise HTTPException(400, f"item[{i}] must provide image_url/image_path and/or text")
 
-            try:
-                # 保持 images 与 text 的“标量类型 str”一致（单样本）
-                if img_ref is not None and txt is not None:
-                    vec = _model.encode(images=img_ref, text=txt)
-                elif img_ref is not None:
-                    vec = _model.encode(images=img_ref)
+            # ✅ 改动点：强制走 batch 路径（list[str]），并做同设备重试（仍在 GPU）
+            images_arg = [img_ref] if img_ref is not None else None
+            text_arg   = [txt]     if txt     is not None else None
+
+            def _encode_once():
+                if images_arg is not None and text_arg is not None:
+                    return _model.encode(images=images_arg, text=text_arg)
+                elif images_arg is not None:
+                    return _model.encode(images=images_arg)
                 else:
-                    vec = _model.encode(text=txt)
-            except HTTPException:
-                raise
+                    return _model.encode(text=text_arg)
+
+            try:
+                vec = _encode_once()
             except Exception as e:
-                import traceback
-                raise HTTPException(500, f"bge-vl encode failed on item[{i}]: {e}\n{traceback.format_exc()}")
+                msg = str(e)
+                if (
+                    "Expected all tensors to be on the same device" in msg
+                    and "cuda" in msg and "cpu" in msg
+                ):
+                    try:
+                        # 仅做同设备重试，不降级到 CPU
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        vec = _encode_once()
+                    except Exception as e2:
+                        import traceback
+                        raise HTTPException(500, f"bge-vl encode failed on item[{i}] after same-device retry: {e2}\n{traceback.format_exc()}")
+                else:
+                    import traceback
+                    raise HTTPException(500, f"bge-vl encode failed on item[{i}]: {e}\n{traceback.format_exc()}")
 
             vec_list = _to_list(vec)
-            # 统一处理 [1, D] -> [D]
+            # 统一处理 [[D]] -> [D]
             if isinstance(vec_list, list) and len(vec_list) == 1 and isinstance(vec_list[0], list):
                 vec_list = vec_list[0]
             results.append(vec_list)
