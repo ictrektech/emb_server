@@ -71,8 +71,7 @@ fi
 
 # 构建并推送镜像
 docker build \
-    --build-arg HTTP_PROXY=$PROXY \
-	--build-arg HTTPS_PROXY=$PROXY \
+    --build-arg PROXY=$PROXY \
     -t emb_server \
     -f $PROFILE .
 docker tag emb_server swr.cn-southwest-2.myhuaweicloud.com/ictrek/${IMG_NAME}:${TAG}
