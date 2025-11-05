@@ -1,6 +1,8 @@
 # Dockerfile
 FROM nvcr.io/nvidia/l4t-jetpack:r36.4.0
 
+ARG PROXY
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -18,11 +20,25 @@ RUN apt-get update && apt-get install -y python3 python3-pip git ffmpeg libglib2
 # RUN pip3 config set install.trusted-host mirrors.aliyun.com
 # RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124 \
 # RUN pip3 install -U --no-cache-dir transformers FlagEmbedding uvicorn fastapi
-RUN wget https://pypi.jetson-ai-lab.io/jp6/cu126/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl#sha256=62a1beee9f2f147076a974d2942c90060c12771c94740830327cae705b2595fc && \
-    pip install torch-2.8.0-cp310-cp310-linux_aarch64.whl
 
-RUN wget https://pypi.jetson-ai-lab.io/jp6/cu126/+f/907/c4c1933789645/torchvision-0.23.0-cp310-cp310-linux_aarch64.whl#sha256=907c4c1933789645ebb20dd9181d40f8647978e6bd30086ae7b01febb937d2d1 && \
-    pip install torchvision-0.23.0-cp310-cp310-linux_aarch64.whl
+RUN set -e; \
+    if [ -n "${PROXY:-}" ]; then \
+        echo "using proxy ${PROXY}"; \
+        # 在同一子shell里 export，一次性作用于两个 wget
+        ( export http_proxy="${PROXY}" https_proxy="${PROXY}" HTTP_PROXY="${PROXY}" HTTPS_PROXY="${PROXY}"; \
+          wget -O torch-2.8.0-cp310-cp310-linux_aarch64.whl \
+            https://pypi.jetson-ai-lab.io/jp6/cu126/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl && \
+          wget -O torchvision-0.23.0-cp310-cp310-linux_aarch64.whl \
+            https://pypi.jetson-ai-lab.io/jp6/cu126/+f/907/c4c1933789645/torchvision-0.23.0-cp310-cp310-linux_aarch64.whl \
+        ); \
+    else \
+        wget -O torch-2.8.0-cp310-cp310-linux_aarch64.whl \
+          https://pypi.jetson-ai-lab.io/jp6/cu126/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl && \
+        wget -O torchvision-0.23.0-cp310-cp310-linux_aarch64.whl \
+          https://pypi.jetson-ai-lab.io/jp6/cu126/+f/907/c4c1933789645/torchvision-0.23.0-cp310-cp310-linux_aarch64.whl; \
+    fi && \
+    pip install --no-cache-dir ./torch-2.8.0-cp310-cp310-linux_aarch64.whl ./torchvision-0.23.0-cp310-cp310-linux_aarch64.whl && \
+    rm -f torch-2.8.0-cp310-cp310-linux_aarch64.whl torchvision-0.23.0-cp310-cp310-linux_aarch64.whl
 
 RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple && \
     pip config set install.trusted-host mirrors.aliyun.com && \
