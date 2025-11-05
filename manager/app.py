@@ -54,18 +54,29 @@ def find_free_port() -> int:
     port_alloc.add(p)
     return p
 
-def wait_healthy(w: Worker, timeout: int = 60):
-    start = time.time()
+def wait_healthy(w: Worker, timeout: int = 90):
+    import time, requests
     url = f"http://127.0.0.1:{w.port}/health"
+    start = time.time()
+    ok_in_a_row = 0
+    last_err = None
     while time.time() - start < timeout:
         try:
-            r = requests.get(url, timeout=1)
+            r = requests.get(url, timeout=1.0)
             if r.status_code == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(0.5)
-    raise HTTPException(500, f"Worker failed to become healthy on {url}")
+                ok_in_a_row += 1
+                if ok_in_a_row >= 2:
+                    # 给 uvicorn 再 200ms 缓冲，避免刚绑定端口立刻被并发打爆
+                    time.sleep(0.2)
+                    return
+                time.sleep(0.1)
+                continue
+            last_err = f"status={r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+        ok_in_a_row = 0
+        time.sleep(0.3)
+    raise HTTPException(500, f"Worker failed to become healthy on {url}; last_err={last_err}")
 
 def spawn_worker(model: str) -> Worker:
     # 全局数量限制
@@ -198,18 +209,47 @@ class TextInput(BaseModel):
 
 @app.post("/embed")
 def embed(model: str, body: dict = Body(...)):
-    # 模型白名单校验
+    # 白名单
     if model not in MODEL_SPECS:
         raise HTTPException(404, f"Unknown model {model}")
 
+    def _request_with_worker(w: Worker):
+        r = requests.post(f"http://127.0.0.1:{w.port}/embed", json=body, timeout=120)
+        w.last_used = time.time()
+        return r
+
+    # 取/起 worker
     w = pick_worker(model)
     w.inflight += 1
     try:
-        r = requests.post(f"http://127.0.0.1:{w.port}/embed", json=body, timeout=120)
-        w.last_used = time.time()
-        # r.raise_for_status()  # 将 worker 的错误显式抛出
+        try:
+            r = _request_with_worker(w)
+        except requests.exceptions.ConnectionError:
+            # === 关键：把疑似半启动/已崩的实例摘掉并重试一次 ===
+            try:
+                try:
+                    requests.post(f"http://127.0.0.1:{w.port}/shutdown", timeout=0.5)
+                except Exception:
+                    pass
+                try:
+                    w.proc.terminate()
+                except Exception:
+                    pass
+            finally:
+                # 清理注册与端口占用
+                workers[w.model].remove(w)
+                port_alloc.discard(w.port)
+
+            # 重新拉起一个再打一次
+            w2 = spawn_worker(model)
+            w2.inflight += 1
+            try:
+                r = _request_with_worker(w2)
+            finally:
+                w2.inflight -= 1
+
+        # 透传下游错误文本，方便定位
         if r.status_code >= 400:
-            # 把 worker 返回的具体错误正文带出来，便于定位
             raise HTTPException(r.status_code, f"worker@{w.port} -> {r.text}")
         return r.json()
     finally:
