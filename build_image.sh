@@ -45,6 +45,9 @@ case "$PROFILE" in
   Dockerfile_cu124)
     PROFILE_TAG="${ARCH_TAG}_cu124"
     ;;
+  Dockerfile_cu128)
+    PROFILE_TAG="${ARCH_TAG}_cu128"
+    ;;
   Dockerfile_l4t)
     PROFILE_TAG="${ARCH_TAG}_l4t"
     ;;
