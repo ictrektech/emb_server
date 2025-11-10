@@ -30,8 +30,9 @@ class TextBatch(BaseModel):
 
 
 class VLItem(BaseModel):
-    image_url: Optional[str] = None
-    image_path: Optional[str] = None
+    image_url: Optional[str] = None        # http(s):// 或 data:<mime>;base64,...
+    image_path: Optional[str] = None       # 容器内可见的本地路径
+    image_base64: Optional[str] = None     # 可直接传 data:<mime>;base64,...
     text: Optional[str] = None
 
 
@@ -46,6 +47,64 @@ def _to_list(x):
     if isinstance(x, np.ndarray):
         return x.tolist()
     return x
+
+
+# ---- base64 data URL 处理 ----
+import re
+import base64
+import tempfile
+
+_DATA_URL_RE = re.compile(r"^data:(?P<mime>[-\w.+/]+);base64,(?P<b64>.+)$", re.IGNORECASE)
+
+_MIME_SUFFIX = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+}
+
+def _is_data_url(s: Optional[str]) -> bool:
+    if not isinstance(s, str):
+        return False
+    return s.startswith("data:") and ";base64," in s
+
+def _save_data_url_to_tmp(data_url: str) -> str:
+    """
+    将 data:<mime>;base64,<...> 写入临时文件，返回文件路径。
+    """
+    m = _DATA_URL_RE.match(data_url.strip())
+    if not m:
+        raise HTTPException(400, "invalid data URL format for image (expect data:<mime>;base64,...)")
+
+    mime = m.group("mime").lower()
+    b64 = m.group("b64")
+
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception as e:
+        raise HTTPException(400, f"invalid base64 image data: {e}")
+
+    # 简单的大小保护（可按需调整）
+    if len(raw) > 64 * 1024 * 1024:
+        raise HTTPException(413, "image too large (>64MB)")
+
+    suffix = _MIME_SUFFIX.get(mime, ".img")
+    fd, path = tempfile.mkstemp(prefix="bgevl_", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+    except Exception as e:
+        # 如果写失败，确保文件被清理
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        raise HTTPException(500, f"write temp image failed: {e}")
+
+    return path
 
 
 # -------- Lazy load --------
@@ -180,7 +239,7 @@ def shutdown():
 def embed(body: Dict[str, Any] = Body(...)):
     """
     - bge-m3: TextBatch -> BGEM3FlagModel.encode(...), 取 ['dense_vecs']，按需归一化
-    - bge-vl: VLMixedBatch -> _model.encode(images=..., text=...)；传入字符串（URL/路径）
+    - bge-vl: VLMixedBatch -> _model.encode(images=..., text=...)；传入字符串（URL/路径 或 base64 data URL）
     - qwen3: TextBatch -> SentenceTransformer.encode(..., device=...)
     """
     load_model()
@@ -264,50 +323,71 @@ def embed(body: Dict[str, Any] = Body(...)):
         raise HTTPException(400, "input must be non-empty list")
 
     results: List[List[float]] = []
+    tmp_files: List[str] = []  # 收集需要清理的临时文件
+
     with torch.inference_mode():
-        for i, item in enumerate(batch.input):
-            img_ref = item.image_url or item.image_path
-            txt = item.text
-            if not img_ref and txt is None:
-                raise HTTPException(400, f"item[{i}] must provide image_url/image_path and/or text")
-
-            # ✅ 改动点：强制走 batch 路径（list[str]），并做同设备重试（仍在 GPU）
-            images_arg = [img_ref] if img_ref is not None else None
-            text_arg   = [txt]     if txt     is not None else None
-
-            def _encode_once():
-                if images_arg is not None and text_arg is not None:
-                    return _model.encode(images=images_arg, text=text_arg)
-                elif images_arg is not None:
-                    return _model.encode(images=images_arg)
+        try:
+            for i, item in enumerate(batch.input):
+                # 支持 data URL：优先 image_base64；其次 image_url 若就是 data:
+                img_ref: Optional[str] = None
+                if item.image_base64 and _is_data_url(item.image_base64):
+                    img_ref = _save_data_url_to_tmp(item.image_base64)
+                    tmp_files.append(img_ref)
+                elif item.image_url and _is_data_url(item.image_url):
+                    img_ref = _save_data_url_to_tmp(item.image_url)
+                    tmp_files.append(img_ref)
                 else:
-                    return _model.encode(text=text_arg)
+                    # 传统输入：image_url 或 image_path
+                    img_ref = item.image_url or item.image_path
 
-            try:
-                vec = _encode_once()
-            except Exception as e:
-                msg = str(e)
-                if (
-                    "Expected all tensors to be on the same device" in msg
-                    and "cuda" in msg and "cpu" in msg
-                ):
-                    try:
-                        # 仅做同设备重试，不降级到 CPU
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        vec = _encode_once()
-                    except Exception as e2:
+                txt = item.text
+                if not img_ref and txt is None:
+                    raise HTTPException(400, f"item[{i}] must provide image_url/image_path/image_base64 and/or text")
+
+                # 统一走 batch 路径（list[str]），并做同设备重试（仍在 GPU）
+                images_arg = [img_ref] if img_ref is not None else None
+                text_arg   = [txt]     if txt     is not None else None
+
+                def _encode_once():
+                    if images_arg is not None and text_arg is not None:
+                        return _model.encode(images=images_arg, text=text_arg)
+                    elif images_arg is not None:
+                        return _model.encode(images=images_arg)
+                    else:
+                        return _model.encode(text=text_arg)
+
+                try:
+                    vec = _encode_once()
+                except Exception as e:
+                    msg = str(e)
+                    if (
+                        "Expected all tensors to be on the same device" in msg
+                        and "cuda" in msg and "cpu" in msg
+                    ):
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                            vec = _encode_once()
+                        except Exception as e2:
+                            import traceback
+                            raise HTTPException(500, f"bge-vl encode failed on item[{i}] after same-device retry: {e2}\n{traceback.format_exc()}")
+                    else:
                         import traceback
-                        raise HTTPException(500, f"bge-vl encode failed on item[{i}] after same-device retry: {e2}\n{traceback.format_exc()}")
-                else:
-                    import traceback
-                    raise HTTPException(500, f"bge-vl encode failed on item[{i}]: {e}\n{traceback.format_exc()}")
+                        raise HTTPException(500, f"bge-vl encode failed on item[{i}]: {e}\n{traceback.format_exc()}")
 
-            vec_list = _to_list(vec)
-            # 统一处理 [[D]] -> [D]
-            if isinstance(vec_list, list) and len(vec_list) == 1 and isinstance(vec_list[0], list):
-                vec_list = vec_list[0]
-            results.append(vec_list)
+                vec_list = _to_list(vec)
+                # 统一处理 [[D]] -> [D]
+                if isinstance(vec_list, list) and len(vec_list) == 1 and isinstance(vec_list[0], list):
+                    vec_list = vec_list[0]
+                results.append(vec_list)
+        finally:
+            # 清理本次请求写入的临时图片文件
+            for p in tmp_files:
+                try:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    pass
 
     dim = len(results[0]) if results else 0
     return {"embeddings": results, "dim": dim, "model": MODEL_NAME}
