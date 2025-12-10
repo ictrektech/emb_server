@@ -8,6 +8,14 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 
+import re
+import base64
+import tempfile
+import io
+
+import requests
+from PIL import Image
+
 app = FastAPI()
 
 # -------- 环境 --------
@@ -17,6 +25,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 进程内模型缓存（懒加载）+ 启动锁（避免并发冷启动竞态）
 _model = None
+_processor = None  # 给 SigLip2 / 其他需要 processor 的模型用
 _start_lock = threading.Lock()
 
 
@@ -32,7 +41,7 @@ class TextBatch(BaseModel):
 class VLItem(BaseModel):
     image_url: Optional[str] = None        # http(s):// 或 data:<mime>;base64,...
     image_path: Optional[str] = None       # 容器内可见的本地路径
-    image_base64: Optional[str] = None     # 可直接传 data:<mime>;base64,...
+    image_base64: Optional[str] = None     # data:<mime>;base64,...
     text: Optional[str] = None
 
 
@@ -50,10 +59,6 @@ def _to_list(x):
 
 
 # ---- base64 data URL 处理 ----
-import re
-import base64
-import tempfile
-
 _DATA_URL_RE = re.compile(r"^data:(?P<mime>[-\w.+/]+);base64,(?P<b64>.+)$", re.IGNORECASE)
 
 _MIME_SUFFIX = {
@@ -66,10 +71,12 @@ _MIME_SUFFIX = {
     "image/tiff": ".tiff",
 }
 
+
 def _is_data_url(s: Optional[str]) -> bool:
     if not isinstance(s, str):
         return False
     return s.startswith("data:") and ";base64," in s
+
 
 def _save_data_url_to_tmp(data_url: str) -> str:
     """
@@ -107,6 +114,49 @@ def _save_data_url_to_tmp(data_url: str) -> str:
     return path
 
 
+def _load_pil_image_from_item(item: VLItem, tmp_files: List[str]) -> Image.Image:
+    """
+    给 SigLip2 / BGE-VL 用，把 VLItem 转成 PIL.Image
+    - 支持 image_base64(data URL)、image_url(http/https 或本地路径)、image_path
+    """
+    # data URL 优先
+    if item.image_base64 and _is_data_url(item.image_base64):
+        p = _save_data_url_to_tmp(item.image_base64)
+        tmp_files.append(p)
+        img = Image.open(p).convert("RGB")
+        return img
+
+    if item.image_url:
+        url = item.image_url
+        if url.startswith("http://") or url.startswith("https://"):
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+            except Exception as e:
+                raise HTTPException(400, f"failed to fetch image_url[{url}]: {e}")
+            try:
+                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            except Exception as e:
+                raise HTTPException(400, f"failed to decode image from url[{url}]: {e}")
+            return img
+        else:
+            # 当作本地路径
+            try:
+                img = Image.open(url).convert("RGB")
+            except Exception as e:
+                raise HTTPException(400, f"failed to open local image_url path[{url}]: {e}")
+            return img
+
+    if item.image_path:
+        try:
+            img = Image.open(item.image_path).convert("RGB")
+        except Exception as e:
+            raise HTTPException(400, f"failed to open image_path[{item.image_path}]: {e}")
+        return img
+
+    raise HTTPException(400, "VLItem must provide image_url/image_path/image_base64")
+
+
 # -------- Lazy load --------
 def load_model():
     """
@@ -114,8 +164,9 @@ def load_model():
     - bge-m3: FlagEmbedding BGEM3FlagModel（禁用内置 fp16，避免 .half 报错）
     - bge-vl: transformers AutoModel (trust_remote_code)
     - qwen3-embedding: sentence-transformers SentenceTransformer（构造期不 to）
+    - siglip2-*: google/siglip2-... AutoModel + AutoProcessor
     """
-    global _model
+    global _model, _processor
     if _model is not None:
         return
 
@@ -142,7 +193,6 @@ def load_model():
 
         # ---- BGE-VL (vision-language) ----
         if name in ["bge-vl", "baai/bge-vl", "baai/bge-vl-base", "baai/bge-vl-large"]:
-            # 并发 import 也放到锁里
             from transformers import AutoModel
 
             # 禁用 fused/mem-efficient SDPA，避免 dtype 不一致触发严格校验
@@ -168,7 +218,6 @@ def load_model():
             # 统一 dtype（CUDA=fp16，CPU=fp32）
             target_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-            # 新版 transformers 推荐 dtype=...
             _model = AutoModel.from_pretrained(
                 resolved,
                 trust_remote_code=True,
@@ -188,12 +237,44 @@ def load_model():
             local_path = os.path.join(MODEL_ROOT, "Qwen3-Embedding-0.6B")
             resolved = local_path if os.path.isdir(local_path) else MODEL_NAME
 
-            # 构造期不传 device（避免 meta tensor 迁移报错）
             _model = SentenceTransformer(
                 resolved,
-                # 可选： model_kwargs={"attn_implementation": "flash_attention_2"},
-                # 可选： tokenizer_kwargs={"padding_side": "left"},
             )
+            return
+
+        # ---- SigLip2 (google/siglip2-*) ----
+        # 支持的 MODEL_NAME 形如：siglip2-base-patch16-224 / siglip2-large-patch16-512 等
+        if name.startswith("siglip2-"):
+            from transformers import AutoModel, AutoProcessor
+
+            # 本地目录优先：$MODEL_ROOT/<MODEL_NAME>
+            local_dir = os.path.join(MODEL_ROOT, MODEL_NAME)
+            if os.path.isdir(local_dir):
+                model_id = local_dir
+                processor_id = local_dir
+            else:
+                # 走 HF repo
+                model_id = f"google/{MODEL_NAME}"
+                processor_id = model_id
+
+            # dtype 选择：CUDA 优先 bf16，其次 fp16；CPU 用 fp32
+            if torch.cuda.is_available():
+                if torch.cuda.is_bf16_supported():
+                    target_dtype = torch.bfloat16
+                else:
+                    target_dtype = torch.float16
+            else:
+                target_dtype = torch.float32
+
+            _model = AutoModel.from_pretrained(
+                model_id,
+                torch_dtype=target_dtype,
+                device_map=None,
+            )
+            _model.to(DEVICE, dtype=target_dtype)
+            _model.eval()
+
+            _processor = AutoProcessor.from_pretrained(processor_id)
             return
 
         raise RuntimeError(f"Unknown MODEL_NAME={MODEL_NAME}")
@@ -217,13 +298,14 @@ def shutdown():
     import os as _os
 
     try:
-        global _model
+        global _model, _processor
         if _model is not None:
             try:
                 _model.to("cpu")
             except Exception:
                 pass
             _model = None
+        _processor = None
         if torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
@@ -239,8 +321,11 @@ def shutdown():
 def embed(body: Dict[str, Any] = Body(...)):
     """
     - bge-m3: TextBatch -> BGEM3FlagModel.encode(...), 取 ['dense_vecs']，按需归一化
-    - bge-vl: VLMixedBatch -> _model.encode(images=..., text=...)；传入字符串（URL/路径 或 base64 data URL）
-    - qwen3: TextBatch -> SentenceTransformer.encode(..., device=...)
+    - bge-vl: VLMixedBatch -> _model.encode(images=..., text=...)
+    - qwen3: TextBatch -> SentenceTransformer.encode(...)
+    - siglip2-*:
+        * 输入为 list[str] -> text features
+        * 输入为 list[VLItem] -> image features
     """
     load_model()
     name = MODEL_NAME.lower()
@@ -299,7 +384,7 @@ def embed(body: Dict[str, Any] = Body(...)):
                 "convert_to_numpy": True,
                 "normalize_embeddings": normalize,
                 "show_progress_bar": False,
-                "device": device_arg,  # 运行期指定设备，规避 meta tensor 迁移问题
+                "device": device_arg,
             }
             if prompt_name:
                 kwargs["prompt_name"] = prompt_name
@@ -313,7 +398,89 @@ def embed(body: Dict[str, Any] = Body(...)):
         dim = len(vecs[0]) if len(vecs) > 0 else 0
         return {"embeddings": vecs, "dim": dim, "model": MODEL_NAME}
 
-    # ----- bge-vl -----
+    # ----- SigLip2 -----
+    if name.startswith("siglip2-"):
+        if _processor is None:
+            raise HTTPException(500, "SigLip2 processor not initialized")
+
+        inputs = body.get("input", None)
+        if not isinstance(inputs, list) or len(inputs) == 0:
+            raise HTTPException(400, "input must be a non-empty list")
+
+        normalize = bool(body.get("normalize", True))
+
+        # 文本模式：list[str]
+        if isinstance(inputs[0], str):
+            texts: List[str] = inputs
+            try:
+                enc = _processor(
+                    text=texts,
+                    padding="max_length",
+                    max_length=64,
+                    return_tensors="pt",
+                )
+            except Exception as e:
+                raise HTTPException(400, f"SigLip2 text processing failed: {e}")
+
+            # 移到设备
+            enc = {k: v.to(DEVICE) for k, v in enc.items()}
+
+            with torch.no_grad():
+                # SigLip2 文本：使用 get_text_features
+                vecs = _model.get_text_features(**enc)  # (B, D)
+
+                if normalize:
+                    import torch.nn.functional as F
+                    vecs = F.normalize(vecs, p=2, dim=-1)
+
+            vecs = _to_list(vecs)
+            dim = len(vecs[0]) if vecs else 0
+            return {"embeddings": vecs, "dim": dim, "model": MODEL_NAME, "modality": "text"}
+
+        # 图片模式：list[VLItem-like]
+        tmp_files: List[str] = []
+        try:
+            batch = VLMixedBatch(**body)
+        except Exception as e:
+            raise HTTPException(400, f"invalid body for siglip2 image mode: {e}")
+
+        if not batch.input:
+            raise HTTPException(400, "input must be non-empty list")
+
+        images: List[Image.Image] = []
+        try:
+            for item in batch.input:
+                img = _load_pil_image_from_item(item, tmp_files)
+                images.append(img)
+
+            try:
+                enc = _processor(images=images, return_tensors="pt")
+            except Exception as e:
+                raise HTTPException(400, f"SigLip2 image processing failed: {e}")
+
+            enc = {k: v.to(DEVICE) for k, v in enc.items()}
+
+            with torch.no_grad():
+                # SigLip2 图片：使用 get_image_features
+                vecs = _model.get_image_features(**enc)  # (B, D)
+                if normalize:
+                    import torch.nn.functional as F
+                    vecs = F.normalize(vecs, p=2, dim=-1)
+
+            vecs = _to_list(vecs)
+            dim = len(vecs[0]) if vecs else 0
+            return {"embeddings": vecs, "dim": dim, "model": MODEL_NAME, "modality": "image"}
+
+        finally:
+            # 清理临时文件
+            for p in tmp_files:
+                try:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    pass
+
+    # ----- bge-vl (默认走这里) -----
     try:
         batch = VLMixedBatch(**body)
     except Exception as e:

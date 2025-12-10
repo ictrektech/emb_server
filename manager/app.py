@@ -28,6 +28,13 @@ MODEL_SPECS: Dict[str, Dict] = {
     "qwen3-embedding": {"type": "text"},
     "qwen3-embedding-0.6b": {"type": "text"},
     "qwen/qwen3-embedding-0.6b": {"type": "text"},
+    "siglip2-base-patch16-224": {"type": "vl"},
+    "siglip2-base-patch16-256": {"type": "vl"},
+    "siglip2-base-patch16-384": {"type": "vl"},
+    "siglip2-base-patch16-512": {"type": "vl"},
+    "siglip2-large-patch16-256": {"type": "vl"},
+    "siglip2-large-patch16-384": {"type": "vl"},
+    "siglip2-large-patch16-512": {"type": "vl"},
 }
 
 # -------- 状态 --------
