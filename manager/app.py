@@ -289,3 +289,72 @@ def _start_evictor():
 def evict_now():
     evict_idle()
     return {"ok": True}
+
+
+# ===== 强制回收：不管 inflight 是否在工作，全部干掉 =====
+def evict_all(force_kill: bool = False):
+    """
+    强制回收所有 worker（无视 inflight）：
+    - 尝试调用 /shutdown（优雅退出）
+    - terminate
+    - 可选：kill（force_kill=True 时）
+    - 清理 workers 注册与 port_alloc
+    """
+    # 先扁平化拷贝，避免遍历时修改 dict/list
+    all_workers: List[Worker] = [w for arr in workers.values() for w in arr]
+
+    # 先尽力优雅 shutdown（不等待太久）
+    for w in all_workers:
+        try:
+            requests.post(f"http://127.0.0.1:{w.port}/shutdown", timeout=0.5)
+        except Exception:
+            pass
+
+    # terminate + 可选 kill
+    for w in all_workers:
+        try:
+            if w.proc and w.proc.poll() is None:
+                w.proc.terminate()
+        except Exception:
+            pass
+
+    # 稍微等一下让 terminate 生效
+    for w in all_workers:
+        try:
+            if w.proc and w.proc.poll() is None:
+                w.proc.wait(timeout=1.5)
+        except Exception:
+            pass
+
+    if force_kill:
+        for w in all_workers:
+            try:
+                if w.proc and w.proc.poll() is None:
+                    w.proc.kill()
+            except Exception:
+                pass
+
+    # 清理注册表与端口占用
+    for w in all_workers:
+        try:
+            if w.model in workers and w in workers[w.model]:
+                workers[w.model].remove(w)
+                if not workers[w.model]:
+                    workers.pop(w.model, None)
+        except Exception:
+            pass
+        try:
+            port_alloc.discard(w.port)
+        except Exception:
+            pass
+
+
+@app.post("/evict_all")
+def evict_all_now(force_kill: bool = False):
+    """
+    强制清理全部 worker（无视 inflight）。
+    force_kill=false：terminate 为主（默认）
+    force_kill=true：terminate 后仍不退出则 kill
+    """
+    evict_all(force_kill=force_kill)
+    return {"ok": True, "force_kill": force_kill}
