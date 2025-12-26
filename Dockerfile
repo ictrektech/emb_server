@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y python3 python3-pip git ffmpeg libglib2
 RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple
 RUN pip3 config set install.trusted-host mirrors.aliyun.com
 RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
-RUN pip3 install -U --no-cache-dir transformers FlagEmbedding uvicorn fastapi
+RUN pip3 install -U --no-cache-dir transformers FlagEmbedding uvicorn fastapi open-clip-torch timm
 
 WORKDIR /app
 COPY manager/ /app/manager/

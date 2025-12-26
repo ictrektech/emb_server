@@ -23,9 +23,18 @@ MODEL_NAME = os.getenv("MODEL_NAME", "bge-m3").strip()
 MODEL_ROOT = os.getenv("MODEL_ROOT", "/root/models").strip()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# 可选：显式指定 open-clip 本地目录（最稳）
+# 例如：OPENCLIP_MODEL_DIR=/home/jhu/dev/models/embs/ViT-B-16-SigLIP2
+OPENCLIP_MODEL_DIR = os.getenv("OPENCLIP_MODEL_DIR", "").strip()
+
 # 进程内模型缓存（懒加载）+ 启动锁（避免并发冷启动竞态）
 _model = None
-_processor = None  # 给 SigLip2 / 其他需要 processor 的模型用
+_processor = None  # 给 transformers SigLip2 / 其他需要 processor 的模型用
+
+# open-clip 相关
+_openclip_preprocess = None
+_openclip_tokenizer = None
+
 _start_lock = threading.Lock()
 
 
@@ -104,7 +113,6 @@ def _save_data_url_to_tmp(data_url: str) -> str:
         with os.fdopen(fd, "wb") as f:
             f.write(raw)
     except Exception as e:
-        # 如果写失败，确保文件被清理
         try:
             os.unlink(path)
         except Exception:
@@ -116,7 +124,7 @@ def _save_data_url_to_tmp(data_url: str) -> str:
 
 def _load_pil_image_from_item(item: VLItem, tmp_files: List[str]) -> Image.Image:
     """
-    给 SigLip2 / BGE-VL 用，把 VLItem 转成 PIL.Image
+    给 SigLip2 / BGE-VL / OpenCLIP 用，把 VLItem 转成 PIL.Image
     - 支持 image_base64(data URL)、image_url(http/https 或本地路径)、image_path
     """
     # data URL 优先
@@ -165,12 +173,13 @@ def load_model():
     - bge-vl: transformers AutoModel (trust_remote_code)
     - qwen3-embedding: sentence-transformers SentenceTransformer（构造期不 to）
     - siglip2-*: google/siglip2-... AutoModel + AutoProcessor
+    - openclip-vit-b-16-siglip2: open-clip-torch create_model_from_pretrained + get_tokenizer
     """
-    global _model, _processor
+    global _model, _processor, _openclip_preprocess, _openclip_tokenizer
     if _model is not None:
         return
 
-    with _start_lock:  # 同一进程内串行初始化，避免并发导入/构造竞态
+    with _start_lock:
         if _model is not None:
             return
 
@@ -181,9 +190,7 @@ def load_model():
             from FlagEmbedding import BGEM3FlagModel
             local_path = os.path.join(MODEL_ROOT, "bge-m3")
             resolved = local_path if os.path.isdir(local_path) else MODEL_NAME
-            # 关键：禁用 use_fp16，规避库里 .half() 路径的 dtype 报错
             _model = BGEM3FlagModel(resolved, use_fp16=False)
-            # 尝试把内部 encoder 放到 CUDA（若库不自动放置）
             try:
                 if torch.cuda.is_available() and hasattr(_model, "model"):
                     _model.model.to("cuda")
@@ -195,7 +202,6 @@ def load_model():
         if name in ["bge-vl", "baai/bge-vl", "baai/bge-vl-base", "baai/bge-vl-large"]:
             from transformers import AutoModel
 
-            # 禁用 fused/mem-efficient SDPA，避免 dtype 不一致触发严格校验
             if torch.cuda.is_available():
                 try:
                     torch.backends.cuda.enable_flash_sdp(False)
@@ -204,7 +210,6 @@ def load_model():
                 except Exception:
                     pass
 
-            # 解析本地路径；base/large 自行映射
             base_path = os.path.join(MODEL_ROOT, "BGE-VL-base")
             large_path = os.path.join(MODEL_ROOT, "BGE-VL-large")
             mapping = {
@@ -215,7 +220,6 @@ def load_model():
             }
             resolved = mapping.get(name, MODEL_NAME)
 
-            # 统一 dtype（CUDA=fp16，CPU=fp32）
             target_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
             _model = AutoModel.from_pretrained(
@@ -236,28 +240,56 @@ def load_model():
             from sentence_transformers import SentenceTransformer
             local_path = os.path.join(MODEL_ROOT, "Qwen3-Embedding-0.6B")
             resolved = local_path if os.path.isdir(local_path) else MODEL_NAME
-
-            _model = SentenceTransformer(
-                resolved,
-            )
+            _model = SentenceTransformer(resolved)
             return
 
-        # ---- SigLip2 (google/siglip2-*) ----
-        # 支持的 MODEL_NAME 形如：siglip2-base-patch16-224 / siglip2-large-patch16-512 等
+        # ---- OpenCLIP SigLIP2 (ViT-B-16-SigLIP2) ----
+        # 推荐 MODEL_NAME：openclip-vit-b-16-siglip2
+        if name in ["openclip-vit-b-16-siglip2", "openclip-siglip2-vit-b-16", "vit-b-16-siglip2"]:
+            try:
+                from open_clip import create_model_from_pretrained, get_tokenizer
+            except Exception as e:
+                raise RuntimeError(f"open_clip import failed (need open-clip-torch>=2.31.0): {e}")
+
+            # 目录优先级：
+            # 1) OPENCLIP_MODEL_DIR
+            # 2) MODEL_ROOT/ViT-B-16-SigLIP2
+            # 3) MODEL_ROOT/<MODEL_NAME>
+            candidates = []
+            if OPENCLIP_MODEL_DIR:
+                candidates.append(OPENCLIP_MODEL_DIR)
+            candidates.append(os.path.join(MODEL_ROOT, "ViT-B-16-SigLIP2"))
+            candidates.append(os.path.join(MODEL_ROOT, MODEL_NAME))
+
+            model_dir = None
+            for c in candidates:
+                if c and os.path.isdir(c):
+                    model_dir = c
+                    break
+            if model_dir is None:
+                raise RuntimeError(f"OpenCLIP model dir not found. Tried: {candidates}")
+
+            model_path = f"local-dir:{model_dir}"
+
+            _model, _openclip_preprocess = create_model_from_pretrained(model_path)
+            _openclip_tokenizer = get_tokenizer(model_path)
+
+            _model.to(DEVICE)
+            _model.eval()
+            return
+
+        # ---- SigLip2 (google/siglip2-*) via transformers ----
         if name.startswith("siglip2-"):
             from transformers import AutoModel, AutoProcessor
 
-            # 本地目录优先：$MODEL_ROOT/<MODEL_NAME>
             local_dir = os.path.join(MODEL_ROOT, MODEL_NAME)
             if os.path.isdir(local_dir):
                 model_id = local_dir
                 processor_id = local_dir
             else:
-                # 走 HF repo
                 model_id = f"google/{MODEL_NAME}"
                 processor_id = model_id
 
-            # dtype 选择：CUDA 优先 bf16，其次 fp16；CPU 用 fp32
             if torch.cuda.is_available():
                 if torch.cuda.is_bf16_supported():
                     target_dtype = torch.bfloat16
@@ -298,7 +330,7 @@ def shutdown():
     import os as _os
 
     try:
-        global _model, _processor
+        global _model, _processor, _openclip_preprocess, _openclip_tokenizer
         if _model is not None:
             try:
                 _model.to("cpu")
@@ -306,6 +338,8 @@ def shutdown():
                 pass
             _model = None
         _processor = None
+        _openclip_preprocess = None
+        _openclip_tokenizer = None
         if torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
@@ -323,9 +357,12 @@ def embed(body: Dict[str, Any] = Body(...)):
     - bge-m3: TextBatch -> BGEM3FlagModel.encode(...), 取 ['dense_vecs']，按需归一化
     - bge-vl: VLMixedBatch -> _model.encode(images=..., text=...)
     - qwen3: TextBatch -> SentenceTransformer.encode(...)
-    - siglip2-*:
-        * 输入为 list[str] -> text features
-        * 输入为 list[VLItem] -> image features
+    - openclip-vit-b-16-siglip2:
+        * input 为 list[str] -> encode_text
+        * input 为 list[VLItem] -> encode_image（PIL->preprocess->tensor）
+    - siglip2-* (transformers):
+        * input 为 list[str] -> get_text_features
+        * input 为 list[VLItem] -> get_image_features
     """
     load_model()
     name = MODEL_NAME.lower()
@@ -345,7 +382,6 @@ def embed(body: Dict[str, Any] = Body(...)):
                     max_length=args.max_length,
                 )
                 out = res["dense_vecs"]
-                # 归一化（可选）
                 if args.normalize:
                     import torch.nn.functional as F
                     if isinstance(out, torch.Tensor):
@@ -398,7 +434,70 @@ def embed(body: Dict[str, Any] = Body(...)):
         dim = len(vecs[0]) if len(vecs) > 0 else 0
         return {"embeddings": vecs, "dim": dim, "model": MODEL_NAME}
 
-    # ----- SigLip2 -----
+    # ----- OpenCLIP SigLIP2 (ViT-B-16) -----
+    if name in ["openclip-vit-b-16-siglip2", "openclip-siglip2-vit-b-16", "vit-b-16-siglip2"]:
+        if _openclip_preprocess is None or _openclip_tokenizer is None:
+            raise HTTPException(500, "OpenCLIP preprocess/tokenizer not initialized")
+
+        inputs = body.get("input", None)
+        if not isinstance(inputs, list) or not inputs:
+            raise HTTPException(400, "input must be a non-empty list")
+
+        normalize = bool(body.get("normalize", True))
+
+        # 文本模式：list[str]
+        if isinstance(inputs[0], str):
+            texts: List[str] = inputs
+            try:
+                text_tokens = _openclip_tokenizer(
+                    texts,
+                    context_length=getattr(_model, "context_length", None) or 77
+                ).to(DEVICE)
+            except Exception as e:
+                raise HTTPException(400, f"OpenCLIP tokenize failed: {e}")
+
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                vecs = _model.encode_text(text_tokens, normalize=normalize)
+
+            vecs = _to_list(vecs)
+            dim = len(vecs[0]) if vecs else 0
+            return {"embeddings": vecs, "dim": dim, "model": MODEL_NAME, "modality": "text"}
+
+        # 图片模式：list[VLItem]
+        tmp_files: List[str] = []
+        try:
+            batch = VLMixedBatch(**body)
+        except Exception as e:
+            raise HTTPException(400, f"invalid body for openclip image mode: {e}")
+
+        if not batch.input:
+            raise HTTPException(400, "input must be non-empty list")
+
+        imgs: List[torch.Tensor] = []
+        try:
+            for item in batch.input:
+                pil = _load_pil_image_from_item(item, tmp_files)
+                t = _openclip_preprocess(pil).unsqueeze(0)
+                imgs.append(t)
+
+            image_tensor = torch.cat(imgs, dim=0).to(DEVICE)
+
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                vecs = _model.encode_image(image_tensor, normalize=normalize)
+
+            vecs = _to_list(vecs)
+            dim = len(vecs[0]) if vecs else 0
+            return {"embeddings": vecs, "dim": dim, "model": MODEL_NAME, "modality": "image"}
+
+        finally:
+            for p in tmp_files:
+                try:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    pass
+
+    # ----- SigLip2 (transformers) -----
     if name.startswith("siglip2-"):
         if _processor is None:
             raise HTTPException(500, "SigLip2 processor not initialized")
@@ -422,13 +521,10 @@ def embed(body: Dict[str, Any] = Body(...)):
             except Exception as e:
                 raise HTTPException(400, f"SigLip2 text processing failed: {e}")
 
-            # 移到设备
             enc = {k: v.to(DEVICE) for k, v in enc.items()}
 
             with torch.no_grad():
-                # SigLip2 文本：使用 get_text_features
                 vecs = _model.get_text_features(**enc)  # (B, D)
-
                 if normalize:
                     import torch.nn.functional as F
                     vecs = F.normalize(vecs, p=2, dim=-1)
@@ -461,7 +557,6 @@ def embed(body: Dict[str, Any] = Body(...)):
             enc = {k: v.to(DEVICE) for k, v in enc.items()}
 
             with torch.no_grad():
-                # SigLip2 图片：使用 get_image_features
                 vecs = _model.get_image_features(**enc)  # (B, D)
                 if normalize:
                     import torch.nn.functional as F
@@ -472,7 +567,6 @@ def embed(body: Dict[str, Any] = Body(...)):
             return {"embeddings": vecs, "dim": dim, "model": MODEL_NAME, "modality": "image"}
 
         finally:
-            # 清理临时文件
             for p in tmp_files:
                 try:
                     if p and os.path.exists(p):
@@ -490,12 +584,11 @@ def embed(body: Dict[str, Any] = Body(...)):
         raise HTTPException(400, "input must be non-empty list")
 
     results: List[List[float]] = []
-    tmp_files: List[str] = []  # 收集需要清理的临时文件
+    tmp_files: List[str] = []
 
     with torch.inference_mode():
         try:
             for i, item in enumerate(batch.input):
-                # 支持 data URL：优先 image_base64；其次 image_url 若就是 data:
                 img_ref: Optional[str] = None
                 if item.image_base64 and _is_data_url(item.image_base64):
                     img_ref = _save_data_url_to_tmp(item.image_base64)
@@ -504,16 +597,14 @@ def embed(body: Dict[str, Any] = Body(...)):
                     img_ref = _save_data_url_to_tmp(item.image_url)
                     tmp_files.append(img_ref)
                 else:
-                    # 传统输入：image_url 或 image_path
                     img_ref = item.image_url or item.image_path
 
                 txt = item.text
                 if not img_ref and txt is None:
                     raise HTTPException(400, f"item[{i}] must provide image_url/image_path/image_base64 and/or text")
 
-                # 统一走 batch 路径（list[str]），并做同设备重试（仍在 GPU）
                 images_arg = [img_ref] if img_ref is not None else None
-                text_arg   = [txt]     if txt     is not None else None
+                text_arg = [txt] if txt is not None else None
 
                 def _encode_once():
                     if images_arg is not None and text_arg is not None:
@@ -543,12 +634,10 @@ def embed(body: Dict[str, Any] = Body(...)):
                         raise HTTPException(500, f"bge-vl encode failed on item[{i}]: {e}\n{traceback.format_exc()}")
 
                 vec_list = _to_list(vec)
-                # 统一处理 [[D]] -> [D]
                 if isinstance(vec_list, list) and len(vec_list) == 1 and isinstance(vec_list[0], list):
                     vec_list = vec_list[0]
                 results.append(vec_list)
         finally:
-            # 清理本次请求写入的临时图片文件
             for p in tmp_files:
                 try:
                     if p and os.path.exists(p):
