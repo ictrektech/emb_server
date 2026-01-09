@@ -93,6 +93,21 @@ def wait_healthy(w: Worker, timeout: int = 90):
     raise HTTPException(500, f"Worker failed to become healthy on {url}; last_err={last_err}")
 
 def spawn_worker(model: str) -> Worker:
+    """
+    Spawn a new worker for the specified model.
+
+    This function attempts to create a new worker process for the given model. It checks the current number of workers and ensures that the limits are not exceeded. If the limits are reached, it will evict idle workers or raise an HTTPException if spawning a new worker is not possible.
+
+    Args:
+        model (str): The name of the model for which to spawn a worker.
+
+    Returns:
+        Worker: An instance of the Worker class representing the newly spawned worker.
+
+    Raises:
+        HTTPException: If the maximum number of workers is reached (503) or if the maximum number of replicas for the specified model is exceeded (429).
+    """
+    """"""
     # 全局数量限制
     with workers_lock:
         total = sum(len(v) for v in workers.values())
@@ -151,6 +166,22 @@ def spawn_worker(model: str) -> Worker:
         raise HTTPException(503, f"Failed to spawn worker for {model}: {e}")
 
 def pick_worker(model: str) -> Worker:
+    """
+    Pick a worker for the specified model.
+
+    This function retrieves a worker associated with the given model. If no workers are available, it will attempt to spawn a new worker. The selection process prioritizes workers based on their current inflight requests and the last time they were used.
+
+    Args:
+        model (str): The identifier for the model for which a worker is being requested.
+
+    Returns:
+        Worker: An instance of a Worker that is ready to handle requests for the specified model.
+
+    Raises:
+        HTTPException: If the model is warming up but fails to be ready within the timeout period.
+    """
+
+    """""""
     # 先看有没有可用实例
     with workers_lock:
         arr = list(workers.get(model, []))
@@ -203,6 +234,23 @@ def pick_worker(model: str) -> Worker:
             return arr[0]
 
 def evict_idle():
+    """
+    Evict idle workers from the system.
+
+    This function identifies and terminates workers that have been idle for longer than a specified timeout period.
+    If no workers are found to be idle, it will select the least recently used worker from the pool of all non-inflight workers
+    and terminate that worker instead.
+
+    The function operates under a lock to ensure thread safety when accessing shared resources.
+
+    Raises:
+        Exception: If there are issues with sending shutdown requests or terminating processes.
+
+    Returns:
+        None
+    """
+
+    """"""
     # 先找空闲超时的
     idle: List[Worker] = []
     now = time.time()
