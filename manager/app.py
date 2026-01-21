@@ -38,6 +38,7 @@ MODEL_SPECS: Dict[str, Dict] = {
     "siglip2-large-patch16-512": {"type": "vl"},
     # ---- open_clip pretrained local-dir ----
     "openclip-siglip2-vit-b-16": {"type": "vl"},
+     "baai/bge-vl-large": {"type": "vl"},
 }
 
 # -------- 状态 --------
