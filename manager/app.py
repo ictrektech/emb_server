@@ -28,7 +28,7 @@ MODEL_SPECS: Dict[str, Dict] = {
     "qwen3-embedding": {"type": "text"},
     "qwen3-embedding-0.6b": {"type": "text"},
     "qwen/qwen3-embedding-0.6b": {"type": "text"},
-    # ---- SigLip2 family ----
+    # ---- SigLip2 family (transformers) ----
     "siglip2-base-patch16-224": {"type": "vl"},
     "siglip2-base-patch16-256": {"type": "vl"},
     "siglip2-base-patch16-384": {"type": "vl"},
@@ -38,7 +38,16 @@ MODEL_SPECS: Dict[str, Dict] = {
     "siglip2-large-patch16-512": {"type": "vl"},
     # ---- open_clip pretrained local-dir ----
     "openclip-siglip2-vit-b-16": {"type": "vl"},
-     "baai/bge-vl-large": {"type": "vl"},
+    "openclip-vit-b-16-siglip2": {"type": "vl"},
+    "vit-b-16-siglip2": {"type": "vl"},
+    "baai/bge-vl-large": {"type": "vl"},
+
+    # ---- Immich ONNX SigLIP2 (ViT-B-16-SigLIP2__webli) ----
+    # 你可以用以下任意名字请求，worker 会映射到 HF repo immich-app/ViT-B-16-SigLIP2__webli
+    "immich-vit-b-16-siglip2__webli": {"type": "vl"},
+    "vit-b-16-siglip2__webli": {"type": "vl"},
+    "immich-app/vit-b-16-siglip2__webli": {"type": "vl"},
+    "immich-app/vit-b-16-siglip2__webli@onnx": {"type": "vl"},
 }
 
 # -------- 状态 --------
@@ -81,7 +90,6 @@ def wait_healthy(w: Worker, timeout: int = 90):
             if r.status_code == 200:
                 ok_in_a_row += 1
                 if ok_in_a_row >= 2:
-                    # 给 uvicorn 再 200ms 缓冲，避免刚绑定端口立刻被并发打爆
                     time.sleep(0.2)
                     return
                 time.sleep(0.1)
@@ -94,21 +102,6 @@ def wait_healthy(w: Worker, timeout: int = 90):
     raise HTTPException(500, f"Worker failed to become healthy on {url}; last_err={last_err}")
 
 def spawn_worker(model: str) -> Worker:
-    """
-    Spawn a new worker for the specified model.
-
-    This function attempts to create a new worker process for the given model. It checks the current number of workers and ensures that the limits are not exceeded. If the limits are reached, it will evict idle workers or raise an HTTPException if spawning a new worker is not possible.
-
-    Args:
-        model (str): The name of the model for which to spawn a worker.
-
-    Returns:
-        Worker: An instance of the Worker class representing the newly spawned worker.
-
-    Raises:
-        HTTPException: If the maximum number of workers is reached (503) or if the maximum number of replicas for the specified model is exceeded (429).
-    """
-    """"""
     # 全局数量限制
     with workers_lock:
         total = sum(len(v) for v in workers.values())
@@ -131,76 +124,49 @@ def spawn_worker(model: str) -> Worker:
 
     proc = None
     try:
-        # 启动 worker
         proc = subprocess.Popen(
             [PYTHON_BIN, "-m", "uvicorn", "worker.app:app", "--host", "127.0.0.1", "--port", str(port)],
             env=env
         )
 
-        # 注册 worker
         w = Worker(model, port, proc)
         with workers_lock:
             workers.setdefault(model, []).append(w)
 
-        # 等健康
         wait_healthy(w)
         return w
 
     except Exception as e:
-        # === 关键：失败要清理 ===
         try:
             if proc is not None:
                 proc.terminate()
         except Exception:
             pass
 
-        # 从 worker 表删除
         with workers_lock:
             if model in workers:
                 workers[model] = [x for x in workers[model] if x.port != port]
                 if not workers[model]:
                     workers.pop(model, None)
-            # 端口释放
             port_alloc.discard(port)
 
-        # 抛出错误
         raise HTTPException(503, f"Failed to spawn worker for {model}: {e}")
 
 def pick_worker(model: str) -> Worker:
-    """
-    Pick a worker for the specified model.
-
-    This function retrieves a worker associated with the given model. If no workers are available, it will attempt to spawn a new worker. The selection process prioritizes workers based on their current inflight requests and the last time they were used.
-
-    Args:
-        model (str): The identifier for the model for which a worker is being requested.
-
-    Returns:
-        Worker: An instance of a Worker that is ready to handle requests for the specified model.
-
-    Raises:
-        HTTPException: If the model is warming up but fails to be ready within the timeout period.
-    """
-
-    """""""
-    # 先看有没有可用实例
     with workers_lock:
         arr = list(workers.get(model, []))
     if arr:
         arr = sorted(arr, key=lambda x: (x.inflight, -x.last_used))
         return arr[0]
 
-    # 没有 → 串行化冷启动
     lock = model_locks[model]
     with lock:
-        # 二次检查（可能在等锁时已被别人拉起）
         with workers_lock:
             arr = list(workers.get(model, []))
         if arr:
             arr = sorted(arr, key=lambda x: (x.inflight, -x.last_used))
             return arr[0]
 
-        # 若没人启动，当前线程成为“发起者”
         with workers_lock:
             ev = start_events.get(model)
             if ev is None:
@@ -215,7 +181,6 @@ def pick_worker(model: str) -> Worker:
                 w = spawn_worker(model)
                 return w
             finally:
-                # 无论成功/失败，都要释放等待者
                 with workers_lock:
                     ev2 = start_events.pop(model, None)
                 try:
@@ -224,9 +189,7 @@ def pick_worker(model: str) -> Worker:
                 except Exception:
                     pass
         else:
-            # 已有发起者在启动，当前线程等待结果
             ev.wait(timeout=90)
-
             with workers_lock:
                 arr = list(workers.get(model, []))
             if not arr:
@@ -235,24 +198,6 @@ def pick_worker(model: str) -> Worker:
             return arr[0]
 
 def evict_idle():
-    """
-    Evict idle workers from the system.
-
-    This function identifies and terminates workers that have been idle for longer than a specified timeout period.
-    If no workers are found to be idle, it will select the least recently used worker from the pool of all non-inflight workers
-    and terminate that worker instead.
-
-    The function operates under a lock to ensure thread safety when accessing shared resources.
-
-    Raises:
-        Exception: If there are issues with sending shutdown requests or terminating processes.
-
-    Returns:
-        None
-    """
-
-    """"""
-    # 先找空闲超时的
     idle: List[Worker] = []
     now = time.time()
 
@@ -264,7 +209,6 @@ def evict_idle():
             if w.inflight == 0 and (now - w.last_used) > IDLE_TIMEOUT_S:
                 idle.append(w)
 
-    # 如果没有，LRU 驱逐一个（不驱逐正在处理的）
     if not idle:
         with workers_lock:
             allw = [w for arr in workers.values() for w in arr if w.inflight == 0]
@@ -294,20 +238,10 @@ def evict_idle():
             except Exception:
                 pass
 
-# ===== 强制回收：不管 inflight 是否在工作，全部干掉 =====
 def evict_all(force_kill: bool = False):
-    """
-    强制回收所有 worker（无视 inflight）：
-    - 尝试调用 /shutdown（优雅退出）
-    - terminate
-    - 可选：kill（force_kill=True 时）
-    - 清理 workers 注册与 port_alloc
-    - 释放 start_events 等待者（避免有人 wait 满 90s）
-    """
     with workers_lock:
         all_workers: List[Worker] = [w for arr in workers.values() for w in arr]
 
-        # 释放 warmup 等待者
         for ev in list(start_events.values()):
             try:
                 ev.set()
@@ -315,14 +249,12 @@ def evict_all(force_kill: bool = False):
                 pass
         start_events.clear()
 
-    # 先尽力优雅 shutdown（不等待太久）
     for w in all_workers:
         try:
             requests.post(f"http://127.0.0.1:{w.port}/shutdown", timeout=0.5)
         except Exception:
             pass
 
-    # terminate
     for w in all_workers:
         try:
             if w.proc and w.proc.poll() is None:
@@ -330,7 +262,6 @@ def evict_all(force_kill: bool = False):
         except Exception:
             pass
 
-    # 等一下 terminate
     for w in all_workers:
         try:
             if w.proc and w.proc.poll() is None:
@@ -338,7 +269,6 @@ def evict_all(force_kill: bool = False):
         except Exception:
             pass
 
-    # 可选：kill
     if force_kill:
         for w in all_workers:
             try:
@@ -353,7 +283,6 @@ def evict_all(force_kill: bool = False):
             except Exception:
                 pass
 
-    # 清理注册表与端口占用
     with workers_lock:
         for w in all_workers:
             try:
@@ -378,7 +307,6 @@ class TextInput(BaseModel):
 
 @app.post("/embed")
 def embed(model: str, body: dict = Body(...)):
-    # 白名单
     if model not in MODEL_SPECS:
         raise HTTPException(404, f"Unknown model {model}")
 
@@ -387,14 +315,12 @@ def embed(model: str, body: dict = Body(...)):
         w.last_used = time.time()
         return r
 
-    # 取/起 worker
     w = pick_worker(model)
     w.inflight += 1
     try:
         try:
             r = _request_with_worker(w)
         except requests.exceptions.ConnectionError:
-            # === 关键：把疑似半启动/已崩的实例摘掉并重试一次 ===
             try:
                 try:
                     requests.post(f"http://127.0.0.1:{w.port}/shutdown", timeout=0.5)
@@ -405,7 +331,6 @@ def embed(model: str, body: dict = Body(...)):
                 except Exception:
                     pass
             finally:
-                # 清理注册与端口占用
                 with workers_lock:
                     try:
                         if w.model in workers and w in workers[w.model]:
@@ -419,7 +344,6 @@ def embed(model: str, body: dict = Body(...)):
                     except Exception:
                         pass
 
-            # 重新拉起一个再打一次
             w2 = spawn_worker(model)
             w2.inflight += 1
             try:
@@ -427,7 +351,6 @@ def embed(model: str, body: dict = Body(...)):
             finally:
                 w2.inflight -= 1
 
-        # 透传下游错误文本，方便定位
         if r.status_code >= 400:
             raise HTTPException(r.status_code, f"worker@{w.port} -> {r.text}")
         return r.json()
@@ -464,10 +387,5 @@ def evict_now():
 
 @app.post("/evict_all")
 def evict_all_now(force_kill: bool = False):
-    """
-    强制清理全部 worker（无视 inflight）。
-    force_kill=false：terminate 为主（默认）
-    force_kill=true：terminate 后仍不退出则 kill
-    """
     evict_all(force_kill=force_kill)
     return {"ok": True, "force_kill": force_kill}

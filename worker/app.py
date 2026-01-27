@@ -16,6 +16,10 @@ import io
 import requests
 from PIL import Image
 
+# === NEW: ONNXRuntime + HF download for immich-app/ViT-B-16-SigLIP2__webli ===
+import onnxruntime as ort
+from huggingface_hub import snapshot_download
+
 app = FastAPI()
 
 # -------- 环境 --------
@@ -27,6 +31,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 例如：OPENCLIP_MODEL_DIR=/home/jhu/dev/models/embs/ViT-B-16-SigLIP2
 OPENCLIP_MODEL_DIR = os.getenv("OPENCLIP_MODEL_DIR", "").strip()
 
+# === NEW: immich SigLIP2 webli (ONNX) 目录/缓存 ===
+# 你可以：
+# - 本地：MODEL_ROOT/ViT-B-16-SigLIP2__webli
+# - 或显式指定：IMMICH_SIGLIP2_WEBLI_DIR=/path/to/ViT-B-16-SigLIP2__webli
+# - 或自动从 HF 下载到上述目录
+IMMICH_SIGLIP2_WEBLI_DIR = os.getenv("IMMICH_SIGLIP2_WEBLI_DIR", "").strip()  # optional override
+HF_CACHE_DIR = os.getenv("HF_CACHE_DIR", "").strip()  # optional (huggingface_hub cache_dir)
+
 # 进程内模型缓存（懒加载）+ 启动锁（避免并发冷启动竞态）
 _model = None
 _processor = None  # 给 transformers SigLip2 / 其他需要 processor 的模型用
@@ -34,6 +46,11 @@ _processor = None  # 给 transformers SigLip2 / 其他需要 processor 的模型
 # open-clip 相关
 _openclip_preprocess = None
 _openclip_tokenizer = None
+
+# === NEW: immich onnx session + preprocess cfg ===
+_immich_onnx_sess = None
+_immich_preprocess_cfg = None
+_immich_visual_input_name = "image"
 
 _start_lock = threading.Lock()
 
@@ -124,7 +141,7 @@ def _save_data_url_to_tmp(data_url: str) -> str:
 
 def _load_pil_image_from_item(item: VLItem, tmp_files: List[str]) -> Image.Image:
     """
-    给 SigLip2 / BGE-VL / OpenCLIP 用，把 VLItem 转成 PIL.Image
+    给 SigLip2 / BGE-VL / OpenCLIP / immich-onnx 用，把 VLItem 转成 PIL.Image
     - 支持 image_base64(data URL)、image_url(http/https 或本地路径)、image_path
     """
     # data URL 优先
@@ -165,6 +182,139 @@ def _load_pil_image_from_item(item: VLItem, tmp_files: List[str]) -> Image.Image
     raise HTTPException(400, "VLItem must provide image_url/image_path/image_base64")
 
 
+# === NEW: immich preprocess helpers (resize + center crop + normalize) ===
+def _pil_resize_shorter_side(img: Image.Image, size: int, resample=Image.BICUBIC) -> Image.Image:
+    """immich_ml 的 resize_pil 是“先 resize 再 crop”。这里按最常见实现：把短边缩放到 size，并保持比例。"""
+    w, h = img.size
+    if w == 0 or h == 0:
+        raise HTTPException(400, "invalid image with zero width/height")
+    if w < h:
+        new_w = size
+        new_h = int(round(h * (size / w)))
+    else:
+        new_h = size
+        new_w = int(round(w * (size / h)))
+    return img.resize((new_w, new_h), resample=resample)
+
+def _pil_center_crop(img: Image.Image, size: int) -> Image.Image:
+    w, h = img.size
+    if w < size or h < size:
+        # 兜底：如果 resize 逻辑因为奇怪输入没到 size，再强制 resize 成正方形
+        return img.resize((size, size), Image.BICUBIC)
+    left = int(round((w - size) / 2.0))
+    top = int(round((h - size) / 2.0))
+    return img.crop((left, top, left + size, top + size))
+
+def _immich_onnx_transform(img: Image.Image) -> np.ndarray:
+    """
+    对齐 immich_ml.models.visual.OpenClipVisualEncoder.transform：
+    - resize -> crop -> to_numpy -> normalize(mean/std) -> CHW -> add batch
+    返回 float32, shape=(1,3,H,W)
+    """
+    global _immich_preprocess_cfg
+    if not isinstance(_immich_preprocess_cfg, dict):
+        raise RuntimeError("immich preprocess_cfg not loaded")
+
+    cfg = _immich_preprocess_cfg
+    size = cfg.get("size", 224)
+    if isinstance(size, list):
+        size = int(size[0])
+    else:
+        size = int(size)
+
+    interp = str(cfg.get("interpolation", "bicubic")).lower()
+    if "bilinear" in interp:
+        resample = Image.BILINEAR
+    elif "lanczos" in interp:
+        resample = Image.LANCZOS
+    else:
+        resample = Image.BICUBIC
+
+    mean = np.array(cfg.get("mean", [0.5, 0.5, 0.5]), dtype=np.float32)
+    std = np.array(cfg.get("std", [0.5, 0.5, 0.5]), dtype=np.float32)
+
+    img = img.convert("RGB")
+    img = _pil_resize_shorter_side(img, size, resample=resample)
+    img = _pil_center_crop(img, size)
+
+    arr = np.asarray(img).astype(np.float32) / 255.0  # HWC [0,1]
+    arr = (arr - mean) / std
+    arr = arr.transpose(2, 0, 1)  # CHW
+    arr = np.expand_dims(arr, axis=0)  # 1,3,H,W
+    return arr.astype(np.float32)
+
+
+def _immich_onnx_resolve_dir() -> str:
+    """
+    返回 ViT-B-16-SigLIP2__webli 的本地目录（包含 visual/ 子目录）。
+    优先级：
+    1) IMMICH_SIGLIP2_WEBLI_DIR
+    2) MODEL_ROOT/ViT-B-16-SigLIP2__webli
+    3) snapshot_download -> 写到 MODEL_ROOT/ViT-B-16-SigLIP2__webli
+    """
+    if IMMICH_SIGLIP2_WEBLI_DIR and os.path.isdir(IMMICH_SIGLIP2_WEBLI_DIR):
+        return IMMICH_SIGLIP2_WEBLI_DIR
+
+    local_dir = os.path.join(MODEL_ROOT, "ViT-B-16-SigLIP2__webli")
+    if os.path.isdir(local_dir):
+        return local_dir
+
+    # 下载到本地目录（可复用/可缓存）
+    kwargs = {
+        "repo_id": "immich-app/ViT-B-16-SigLIP2__webli",
+        "local_dir": local_dir,
+        "local_dir_use_symlinks": False,
+    }
+    if HF_CACHE_DIR:
+        kwargs["cache_dir"] = HF_CACHE_DIR
+
+    try:
+        snapshot_download(**kwargs)
+    except Exception as e:
+        raise RuntimeError(f"snapshot_download immich-app/ViT-B-16-SigLIP2__webli failed: {e}")
+    return local_dir
+
+
+def _immich_onnx_load():
+    """
+    加载 immich-app/ViT-B-16-SigLIP2__webli 视觉 encoder（ONNX）：
+    目录结构（HF 上）：
+      ViT-B-16-SigLIP2__webli/
+        visual/
+          model.onnx
+          preprocess_cfg.json
+        rknpu/...
+    """
+    global _immich_onnx_sess, _immich_preprocess_cfg, _immich_visual_input_name
+    if _immich_onnx_sess is not None:
+        return
+
+    model_dir = _immich_onnx_resolve_dir()
+    visual_dir = os.path.join(model_dir, "visual")
+    onnx_path = os.path.join(visual_dir, "model.onnx")
+    cfg_path = os.path.join(visual_dir, "preprocess_cfg.json")
+
+    if not os.path.isfile(onnx_path):
+        raise RuntimeError(f"immich onnx not found: {onnx_path}")
+    if not os.path.isfile(cfg_path):
+        raise RuntimeError(f"immich preprocess cfg not found: {cfg_path}")
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        _immich_preprocess_cfg = json.load(f)
+
+    # providers：尊重 ORT 当前环境可用 provider 顺序
+    providers = ort.get_available_providers()
+    _immich_onnx_sess = ort.InferenceSession(onnx_path, providers=providers)
+
+    # 输入名（大概率是 "image"；做一次探测更稳）
+    try:
+        ins = _immich_onnx_sess.get_inputs()
+        if ins and getattr(ins[0], "name", None):
+            _immich_visual_input_name = ins[0].name
+    except Exception:
+        _immich_visual_input_name = "image"
+
+
 # -------- Lazy load --------
 def load_model():
     """
@@ -174,16 +324,23 @@ def load_model():
     - qwen3-embedding: sentence-transformers SentenceTransformer（构造期不 to）
     - siglip2-*: google/siglip2-... AutoModel + AutoProcessor
     - openclip-vit-b-16-siglip2: open-clip-torch create_model_from_pretrained + get_tokenizer
+    - === NEW === vit-b-16-siglip2__webli: immich 的 ONNX 视觉 encoder（onnxruntime）
     """
-    global _model, _processor, _openclip_preprocess, _openclip_tokenizer
-    if _model is not None:
+    global _model, _processor, _openclip_preprocess, _openclip_tokenizer, _immich_onnx_sess
+    # immich onnx 走独立 session，不占用 _model
+    if _model is not None or _immich_onnx_sess is not None:
         return
 
     with _start_lock:
-        if _model is not None:
+        if _model is not None or _immich_onnx_sess is not None:
             return
 
         name = MODEL_NAME.lower()
+
+        # === NEW: immich-app/ViT-B-16-SigLIP2__webli (ONNX visual) ===
+        if name in ["vit-b-16-siglip2__webli", "immich-app/vit-b-16-siglip2__webli", "immich/vit-b-16-siglip2__webli"]:
+            _immich_onnx_load()
+            return
 
         # ---- BGE-M3 (text) ----
         if name in ["bge-m3", "baai/bge-m3"]:
@@ -330,7 +487,7 @@ def shutdown():
     import os as _os
 
     try:
-        global _model, _processor, _openclip_preprocess, _openclip_tokenizer
+        global _model, _processor, _openclip_preprocess, _openclip_tokenizer, _immich_onnx_sess, _immich_preprocess_cfg
         if _model is not None:
             try:
                 _model.to("cpu")
@@ -340,6 +497,11 @@ def shutdown():
         _processor = None
         _openclip_preprocess = None
         _openclip_tokenizer = None
+
+        # immich onnx
+        _immich_onnx_sess = None
+        _immich_preprocess_cfg = None
+
         if torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
@@ -363,9 +525,56 @@ def embed(body: Dict[str, Any] = Body(...)):
     - siglip2-* (transformers):
         * input 为 list[str] -> get_text_features
         * input 为 list[VLItem] -> get_image_features
+    - === NEW === vit-b-16-siglip2__webli (immich onnx):
+        * input 为 list[VLItem] -> ORT session.run({"image": ...}) -> embeddings
     """
     load_model()
     name = MODEL_NAME.lower()
+
+    # === NEW: immich-app/ViT-B-16-SigLIP2__webli (ONNX visual) ===
+    if name in ["vit-b-16-siglip2__webli", "immich-app/vit-b-16-siglip2__webli", "immich/vit-b-16-siglip2__webli"]:
+        if _immich_onnx_sess is None:
+            raise HTTPException(500, "immich onnx session not initialized")
+
+        try:
+            batch = VLMixedBatch(**body)
+        except Exception as e:
+            raise HTTPException(400, f"invalid body for immich onnx: {e}")
+
+        if not batch.input:
+            raise HTTPException(400, "input must be non-empty list")
+
+        normalize = bool(body.get("normalize", True))
+        tmp_files: List[str] = []
+        outs: List[List[float]] = []
+
+        try:
+            for item in batch.input:
+                img = _load_pil_image_from_item(item, tmp_files)
+                x = _immich_onnx_transform(img)
+
+                try:
+                    y = _immich_onnx_sess.run(None, {_immich_visual_input_name: x})
+                except Exception as e:
+                    raise HTTPException(500, f"immich onnx run failed: {e}")
+
+                # 约定：第一个输出，shape (1, D) 或 (B, D)
+                vec = y[0][0]
+                if normalize:
+                    n = float(np.linalg.norm(vec) + 1e-12)
+                    vec = vec / n
+                outs.append(vec.astype(np.float32).tolist())
+
+        finally:
+            for p in tmp_files:
+                try:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    pass
+
+        dim = len(outs[0]) if outs else 0
+        return {"embeddings": outs, "dim": dim, "model": MODEL_NAME, "modality": "image"}
 
     # ----- bge-m3 -----
     if name in ["bge-m3", "baai/bge-m3"]:
