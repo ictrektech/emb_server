@@ -53,13 +53,13 @@ MODEL_SPECS: Dict[str, Dict] = {
 # -------- 状态 --------
 class Worker:
     def __init__(self, model: str, port: int, proc: subprocess.Popen):
-        self.model = model
+        self.model = model  # canonical model name
         self.port = port
         self.proc = proc
         self.last_used = time.time()
         self.inflight = 0
 
-workers: Dict[str, List[Worker]] = {}   # model -> [Worker,...]
+workers: Dict[str, List[Worker]] = {}   # canonical_model -> [Worker,...]
 port_alloc = set()
 model_locks = defaultdict(threading.Lock)  # 每个模型一个锁
 start_events: Dict[str, threading.Event] = {}  # 冷启动进行中的事件
@@ -68,6 +68,35 @@ app = FastAPI()
 
 # 关键：保护 workers / port_alloc / start_events 的并发读写
 workers_lock = threading.Lock()
+
+
+# -------- Canonicalize model name --------
+def canonical_model_name(model: str) -> str:
+    """
+    将多个别名统一到一个 canonical key，避免同一个模型因为不同字符串被当成多个模型启动多份 worker。
+
+    例：
+      - immich-vit-b-16-siglip2__webli
+      - immich-app/vit-b-16-siglip2__webli
+      - immich-app/vit-b-16-siglip2__webli@onnx
+    都归一为：
+      - vit-b-16-siglip2__webli
+
+    同理：openclip 的一些别名也可归一。
+    """
+    m = (model or "").strip().lower()
+    alias = {
+        # immich onnx
+        "immich-vit-b-16-siglip2__webli": "vit-b-16-siglip2__webli",
+        "immich-app/vit-b-16-siglip2__webli": "vit-b-16-siglip2__webli",
+        "immich-app/vit-b-16-siglip2__webli@onnx": "vit-b-16-siglip2__webli",
+
+        # openclip aliases
+        "openclip-siglip2-vit-b-16": "openclip-vit-b-16-siglip2",
+        "vit-b-16-siglip2": "openclip-vit-b-16-siglip2",
+    }
+    return alias.get(m, model)
+
 
 # -------- 工具 --------
 def find_free_port() -> int:
@@ -78,30 +107,35 @@ def find_free_port() -> int:
         port_alloc.add(p)
         return p
 
+
 def wait_healthy(w: Worker, timeout: int = 90):
-    import time, requests
+    import time as _time
     url = f"http://127.0.0.1:{w.port}/health"
-    start = time.time()
+    start = _time.time()
     ok_in_a_row = 0
     last_err = None
-    while time.time() - start < timeout:
+    while _time.time() - start < timeout:
         try:
             r = requests.get(url, timeout=1.0)
             if r.status_code == 200:
                 ok_in_a_row += 1
                 if ok_in_a_row >= 2:
-                    time.sleep(0.2)
+                    _time.sleep(0.2)
                     return
-                time.sleep(0.1)
+                _time.sleep(0.1)
                 continue
             last_err = f"status={r.status_code}"
         except Exception as e:
             last_err = str(e)
         ok_in_a_row = 0
-        time.sleep(0.3)
+        _time.sleep(0.3)
     raise HTTPException(500, f"Worker failed to become healthy on {url}; last_err={last_err}")
 
+
 def spawn_worker(model: str) -> Worker:
+    """
+    model：必须是 canonical name（外部调用前先 canonical_model_name）
+    """
     # 全局数量限制
     with workers_lock:
         total = sum(len(v) for v in workers.values())
@@ -152,7 +186,11 @@ def spawn_worker(model: str) -> Worker:
 
         raise HTTPException(503, f"Failed to spawn worker for {model}: {e}")
 
+
 def pick_worker(model: str) -> Worker:
+    """
+    model：必须是 canonical name（外部调用前先 canonical_model_name）
+    """
     with workers_lock:
         arr = list(workers.get(model, []))
     if arr:
@@ -197,6 +235,7 @@ def pick_worker(model: str) -> Worker:
             arr = sorted(arr, key=lambda x: (x.inflight, -x.last_used))
             return arr[0]
 
+
 def evict_idle():
     idle: List[Worker] = []
     now = time.time()
@@ -237,6 +276,7 @@ def evict_idle():
                 port_alloc.discard(w.port)
             except Exception:
                 pass
+
 
 def evict_all(force_kill: bool = False):
     with workers_lock:
@@ -297,6 +337,7 @@ def evict_all(force_kill: bool = False):
             except Exception:
                 pass
 
+
 # -------- API --------
 class TextInput(BaseModel):
     input: list
@@ -305,8 +346,12 @@ class TextInput(BaseModel):
     fp16: bool | None = True
     batch: int | None = 32
 
+
 @app.post("/embed")
 def embed(model: str, body: dict = Body(...)):
+    raw_model = model
+    model = canonical_model_name(model)  # (1) canonicalize
+
     if model not in MODEL_SPECS:
         raise HTTPException(404, f"Unknown model {model}")
 
@@ -315,12 +360,14 @@ def embed(model: str, body: dict = Body(...)):
         w.last_used = time.time()
         return r
 
+    # 取/起 worker（使用 canonical name）
     w = pick_worker(model)
     w.inflight += 1
     try:
         try:
             r = _request_with_worker(w)
         except requests.exceptions.ConnectionError:
+            # === 关键：把疑似半启动/已崩的实例摘掉并重试一次 ===
             try:
                 try:
                     requests.post(f"http://127.0.0.1:{w.port}/shutdown", timeout=0.5)
@@ -344,6 +391,7 @@ def embed(model: str, body: dict = Body(...)):
                     except Exception:
                         pass
 
+            # 重新拉起一个再打一次
             w2 = spawn_worker(model)
             w2.inflight += 1
             try:
@@ -352,20 +400,24 @@ def embed(model: str, body: dict = Body(...)):
                 w2.inflight -= 1
 
         if r.status_code >= 400:
-            raise HTTPException(r.status_code, f"worker@{w.port} -> {r.text}")
+            # (2) 区分 raw_model / canonical model，方便定位
+            raise HTTPException(r.status_code, f"worker@{w.port} ({raw_model} -> {model}) -> {r.text}")
         return r.json()
     finally:
         w.inflight -= 1
+
 
 @app.get("/metrics")
 def metrics():
     with workers_lock:
         total = sum(len(v) for v in workers.values())
         flat = [
+            # (3) metrics 输出 canonical model，调试稳定；请求侧如需 raw_model，可从日志/HTTPException里看
             {"model": w.model, "port": w.port, "inflight": w.inflight, "last_used": w.last_used}
             for arr in workers.values() for w in arr
         ]
     return {"total": total, "workers": flat}
+
 
 def _evictor_loop():
     while True:
@@ -375,15 +427,18 @@ def _evictor_loop():
             pass
         time.sleep(EVICTOR_INTERVAL_S)
 
+
 @app.on_event("startup")
 def _start_evictor():
     t = threading.Thread(target=_evictor_loop, daemon=True)
     t.start()
 
+
 @app.post("/evict")
 def evict_now():
     evict_idle()
     return {"ok": True}
+
 
 @app.post("/evict_all")
 def evict_all_now(force_kill: bool = False):
