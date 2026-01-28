@@ -365,16 +365,31 @@ def _immich_encode_text(texts: List[str], normalize: bool) -> np.ndarray:
     _immich_load()
     assert _immich_text_sess is not None and _immich_tokenizer is not None
 
-    ids = []
-    for t in texts:
-        enc = _immich_tokenizer.encode((t or "").strip())
-        ids.append(enc.ids)
-    arr = np.array(ids, dtype=np.int32)
+    enc = _immich_tokenizer.encode_batch([(t or "").strip() for t in texts])
+    ids = np.array([e.ids for e in enc], dtype=np.int32)
 
-    vecs = _immich_text_sess.run(None, {"text": arr})[0].astype(np.float32)
+    # Some exports are fixed-batch (=1). We try batched first; if ORT rejects dim0, fallback to per-item.
+    def _run(ids_batch: np.ndarray) -> np.ndarray:
+        out = _immich_text_sess.run(None, {"text": ids_batch})[0]
+        return out.astype(np.float32)
+
+    vecs: np.ndarray
+    try:
+        vecs = _run(ids)
+    except Exception as e:
+        msg = str(e)
+        # Typical error: "Got invalid dimensions ... Got: 4 Expected: 1"
+        if ("invalid dimensions" in msg.lower() and "expected: 1" in msg.lower()) or ("expected: 1" in msg):
+            outs: List[np.ndarray] = []
+            for i in range(ids.shape[0]):
+                out_i = _run(ids[i:i+1])[0]
+                outs.append(out_i)
+            vecs = np.stack(outs, axis=0).astype(np.float32)
+        else:
+            raise
+
     if normalize:
-        n = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
-        vecs = vecs / n
+        vecs = _l2_normalize_np(vecs)
     return vecs
 
 
@@ -383,15 +398,30 @@ def _immich_encode_image(images: List[Image.Image], normalize: bool) -> np.ndarr
     assert _immich_visual_sess is not None and _immich_preprocess is not None
 
     xs = [_immich_image_to_tensor(img, _immich_preprocess) for img in images]
-    x = np.concatenate(xs, axis=0)
-    vecs = _immich_visual_sess.run(None, {"image": x})[0].astype(np.float32)
+    x = np.stack(xs, axis=0).astype(np.float32)
+
+    # Handle fixed batch dim (=1) exports
+    try:
+        inp0 = _immich_visual_sess.get_inputs()[0]
+        b0 = inp0.shape[0] if inp0.shape and len(inp0.shape) > 0 else None
+    except Exception:
+        b0 = None
+
+    if b0 == 1 and x.shape[0] != 1:
+        outs: List[np.ndarray] = []
+        for i in range(x.shape[0]):
+            out = _immich_visual_sess.run(None, {"image": x[i:i+1]})[0]
+            outs.append(out[0])
+        vecs = np.stack(outs, axis=0).astype(np.float32)
+    else:
+        vecs = _immich_visual_sess.run(None, {"image": x})[0].astype(np.float32)
+
     if normalize:
-        n = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-12
-        vecs = vecs / n
+        vecs = _l2_normalize_np(vecs)
     return vecs
 
 
-# -------- Lazy load for all models --------
+
 def load_model():
     global _model, _processor, _openclip_preprocess, _openclip_tokenizer
 
