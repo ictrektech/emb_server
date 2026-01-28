@@ -271,10 +271,7 @@ def _immich_image_to_tensor(img: Image.Image, cfg: Dict[str, Any]) -> np.ndarray
     arr = np.asarray(img).astype(np.float32) / 255.0  # HWC RGB
     arr = (arr - cfg["mean"]) / cfg["std"]
     arr = arr.transpose(2, 0, 1)  # CHW
-    arr = np.expand_dims(arr, 0)  # NCHW
     return arr.astype(np.float32)
-
-
 def _immich_select_ort_providers() -> List[str]:
     import onnxruntime as ort
     avail = ort.get_available_providers()
