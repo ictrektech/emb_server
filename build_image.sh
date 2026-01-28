@@ -57,6 +57,11 @@ case "$PROFILE" in
     ;;
 esac
 
+BUILD_ARGS=()
+if [[ -n "${PROXY:-}" ]]; then
+  echo "Using PROXY=${PROXY}"
+  BUILD_ARGS+=(--build-arg "PROXY=${PROXY}")
+fi
 
 # 获取日期
 DATE=$(date +%Y%m%d)
@@ -74,7 +79,7 @@ fi
 
 # 构建并推送镜像
 docker build \
-    --build-arg PROXY=$PROXY \
+    "${BUILD_ARGS[@]}" \
     -t emb_server \
     -f $PROFILE .
 docker tag emb_server swr.cn-southwest-2.myhuaweicloud.com/ictrek/${IMG_NAME}:${TAG}

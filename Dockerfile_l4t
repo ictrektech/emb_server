@@ -49,6 +49,20 @@ RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple && \
     --upgrade-strategy only-if-needed \
     --break-system-packages
 
+RUN set -e; \
+    if [ -n "${PROXY}" ]; then \
+      echo "Using PROXY=${PROXY} for pip"; \
+      export HTTP_PROXY="${PROXY}" HTTPS_PROXY="${PROXY}" http_proxy="${PROXY}" https_proxy="${PROXY}"; \
+      export NO_PROXY="localhost,127.0.0.1" no_proxy="localhost,127.0.0.1"; \
+    fi; \
+    pip3 install --no-cache-dir --break-system-packages \
+      numpy==1.26.4 \
+      onnxruntime-gpu \
+      --index-url https://pypi.jetson-ai-lab.io/jp6/cu129/+simple \
+      --trusted-host pypi.jetson-ai-lab.io \
+      --timeout 120 --retries 5 \
+      --upgrade-strategy only-if-needed
+
 
 WORKDIR /app
 COPY manager/ /app/manager/
