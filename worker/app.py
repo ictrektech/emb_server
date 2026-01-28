@@ -98,6 +98,13 @@ def _to_list(x):
     return x
 
 
+def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """L2-normalize a numpy array on the last dimension."""
+    x = x.astype(np.float32, copy=False)
+    denom = np.linalg.norm(x, axis=-1, keepdims=True)
+    denom = np.maximum(denom, eps)
+    return x / denom
+
 _DATA_URL_RE = re.compile(r"^data:(?P<mime>[-\w.+/]+);base64,(?P<b64>.+)$", re.IGNORECASE)
 _MIME_SUFFIX = {
     "image/jpeg": ".jpg",
