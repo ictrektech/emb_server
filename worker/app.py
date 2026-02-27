@@ -139,6 +139,15 @@ _MIME_SUFFIX = {
 
 
 def _is_data_url(s: Optional[str]) -> bool:
+    """
+    检查字符串是否为有效的Base64数据URL格式
+
+    Args:
+        s (Optional[str]): 待检查的字符串，可能为None
+
+    Returns:
+        bool: 如果字符串是有效的Base64数据URL格式则返回True，否则返回False
+    """
     return isinstance(s, str) and s.startswith("data:") and ";base64," in s
 
 
