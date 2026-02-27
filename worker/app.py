@@ -91,6 +91,16 @@ class VLMixedBatch(BaseModel):
 
 # -------- Utils --------
 def _to_list(x):
+    """
+    将输入数据转换为Python列表形式
+
+    Args:
+        x (Union[torch.Tensor, np.ndarray, Any]): 输入数据，可以是PyTorch张量、NumPy数组或其他类型
+
+    Returns:
+        list: 转换后的Python列表。如果输入是张量或数组，会先将其转换为CPU上的Python列表；
+              如果是其他类型，则直接返回原值
+    """
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().tolist()
     if isinstance(x, np.ndarray):
@@ -99,11 +109,22 @@ def _to_list(x):
 
 
 def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    对numpy数组在最后一个维度上进行L2归一化处理
+
+    Args:
+        x (np.ndarray): 输入的多维数组
+        eps (float, optional): 防止除以零的小值，默认为1e-12
+
+    Returns:
+        np.ndarray: 归一化后的数组，保持与输入相同的维度
+    """
     """L2-normalize a numpy array on the last dimension."""
     x = x.astype(np.float32, copy=False)
     denom = np.linalg.norm(x, axis=-1, keepdims=True)
     denom = np.maximum(denom, eps)
     return x / denom
+
 
 _DATA_URL_RE = re.compile(r"^data:(?P<mime>[-\w.+/]+);base64,(?P<b64>.+)$", re.IGNORECASE)
 _MIME_SUFFIX = {
@@ -423,7 +444,6 @@ def _immich_encode_image(images: List[Image.Image], normalize: bool) -> np.ndarr
     if normalize:
         vecs = _l2_normalize_np(vecs)
     return vecs
-
 
 
 def load_model():
