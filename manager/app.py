@@ -18,11 +18,15 @@ PER_MODEL_MAX = int(os.getenv("PER_MODEL_MAX", 2))
 PYTHON_BIN = os.environ.get("PYTHON_BIN", "python")  # 用 python -m uvicorn 更稳
 EVICTOR_INTERVAL_S = int(os.getenv("EVICTOR_INTERVAL_S", 60))  # 每 60s 扫一遍
 
+# -------- 常驻模型（逗号分隔）--------
+# 示例：PINNED_MODELS=vit-b-16-siglip2__webli,openclip-vit-b-16-siglip2
+PINNED_MODELS_RAW = [s.strip() for s in os.getenv("PINNED_MODELS", "").split(",") if s.strip()]
+
 # 声明可用模型（用于白名单 & 类型标注）
 MODEL_SPECS: Dict[str, Dict] = {
     "bge-m3": {"type": "text"},
     "bge-vl": {"type": "vl"},
-    # ---- Qwen3 Embedding 兼容别名（新增）----
+    # ---- Qwen3 Embedding 兼容别名 ----
     "qwen": {"type": "text"},
     "qwen-embedding": {"type": "text"},
     "qwen3-embedding": {"type": "text"},
@@ -43,7 +47,6 @@ MODEL_SPECS: Dict[str, Dict] = {
     "baai/bge-vl-large": {"type": "vl"},
 
     # ---- Immich ONNX SigLIP2 (ViT-B-16-SigLIP2__webli) ----
-    # 你可以用以下任意名字请求，worker 会映射到 HF repo immich-app/ViT-B-16-SigLIP2__webli
     "immich-vit-b-16-siglip2__webli": {"type": "vl"},
     "vit-b-16-siglip2__webli": {"type": "vl"},
     "immich-app/vit-b-16-siglip2__webli": {"type": "vl"},
@@ -52,12 +55,13 @@ MODEL_SPECS: Dict[str, Dict] = {
 
 # -------- 状态 --------
 class Worker:
-    def __init__(self, model: str, port: int, proc: subprocess.Popen):
+    def __init__(self, model: str, port: int, proc: subprocess.Popen, pinned: bool = False):
         self.model = model  # canonical model name
         self.port = port
         self.proc = proc
         self.last_used = time.time()
         self.inflight = 0
+        self.pinned = pinned
 
 workers: Dict[str, List[Worker]] = {}   # canonical_model -> [Worker,...]
 port_alloc = set()
@@ -74,15 +78,6 @@ workers_lock = threading.Lock()
 def canonical_model_name(model: str) -> str:
     """
     将多个别名统一到一个 canonical key，避免同一个模型因为不同字符串被当成多个模型启动多份 worker。
-
-    例：
-      - immich-vit-b-16-siglip2__webli
-      - immich-app/vit-b-16-siglip2__webli
-      - immich-app/vit-b-16-siglip2__webli@onnx
-    都归一为：
-      - vit-b-16-siglip2__webli
-
-    同理：openclip 的一些别名也可归一。
     """
     m = (model or "").strip().lower()
     alias = {
@@ -96,6 +91,22 @@ def canonical_model_name(model: str) -> str:
         "vit-b-16-siglip2": "openclip-vit-b-16-siglip2",
     }
     return alias.get(m, model)
+
+
+# -------- 常驻判断（基于 canonical）--------
+PINNED_MODELS = set(canonical_model_name(x) for x in PINNED_MODELS_RAW)
+
+def _is_pinned_model(canonical_model: str) -> bool:
+    if not canonical_model:
+        return False
+    m = canonical_model_name(canonical_model)
+    if m in PINNED_MODELS:
+        return True
+    # 兜底：只要 pin 了任一 siglip2__webli，就认为该族都 pinned
+    ml = m.lower()
+    if "siglip2__webli" in ml and any("siglip2__webli" in x.lower() for x in PINNED_MODELS):
+        return True
+    return False
 
 
 # -------- 工具 --------
@@ -136,6 +147,8 @@ def spawn_worker(model: str) -> Worker:
     """
     model：必须是 canonical name（外部调用前先 canonical_model_name）
     """
+    pinned = _is_pinned_model(model)
+
     # 全局数量限制
     with workers_lock:
         total = sum(len(v) for v in workers.values())
@@ -155,6 +168,7 @@ def spawn_worker(model: str) -> Worker:
     env = os.environ.copy()
     env["MODEL_NAME"] = model
     env["PORT"] = str(port)
+    env["PINNED"] = "1" if pinned else "0"
 
     proc = None
     try:
@@ -163,7 +177,7 @@ def spawn_worker(model: str) -> Worker:
             env=env
         )
 
-        w = Worker(model, port, proc)
+        w = Worker(model, port, proc, pinned=pinned)
         with workers_lock:
             workers.setdefault(model, []).append(w)
 
@@ -237,6 +251,9 @@ def pick_worker(model: str) -> Worker:
 
 
 def evict_idle():
+    """
+    回收 idle worker：跳过 pinned 模型
+    """
     idle: List[Worker] = []
     now = time.time()
 
@@ -245,12 +262,18 @@ def evict_idle():
 
     for _, arr in snapshot:
         for w in arr:
+            if _is_pinned_model(w.model):
+                continue
             if w.inflight == 0 and (now - w.last_used) > IDLE_TIMEOUT_S:
                 idle.append(w)
 
     if not idle:
         with workers_lock:
-            allw = [w for arr in workers.values() for w in arr if w.inflight == 0]
+            allw = [
+                w for arr in workers.values()
+                for w in arr
+                if w.inflight == 0 and (not _is_pinned_model(w.model))
+            ]
         if not allw:
             return
         idle = [sorted(allw, key=lambda x: x.last_used)[0]]
@@ -279,8 +302,14 @@ def evict_idle():
 
 
 def evict_all(force_kill: bool = False):
+    """
+    force_kill=False：只清理非 pinned
+    force_kill=True：全部清理（包括 pinned）
+    """
     with workers_lock:
         all_workers: List[Worker] = [w for arr in workers.values() for w in arr]
+        if not force_kill:
+            all_workers = [w for w in all_workers if not _is_pinned_model(w.model)]
 
         for ev in list(start_events.values()):
             try:
@@ -350,7 +379,7 @@ class TextInput(BaseModel):
 @app.post("/embed")
 def embed(model: str, body: dict = Body(...)):
     raw_model = model
-    model = canonical_model_name(model)  # (1) canonicalize
+    model = canonical_model_name(model)
 
     if model not in MODEL_SPECS:
         raise HTTPException(404, f"Unknown model {model}")
@@ -360,14 +389,13 @@ def embed(model: str, body: dict = Body(...)):
         w.last_used = time.time()
         return r
 
-    # 取/起 worker（使用 canonical name）
     w = pick_worker(model)
     w.inflight += 1
     try:
         try:
             r = _request_with_worker(w)
         except requests.exceptions.ConnectionError:
-            # === 关键：把疑似半启动/已崩的实例摘掉并重试一次 ===
+            # 把疑似半启动/已崩的实例摘掉并重试一次
             try:
                 try:
                     requests.post(f"http://127.0.0.1:{w.port}/shutdown", timeout=0.5)
@@ -391,7 +419,6 @@ def embed(model: str, body: dict = Body(...)):
                     except Exception:
                         pass
 
-            # 重新拉起一个再打一次
             w2 = spawn_worker(model)
             w2.inflight += 1
             try:
@@ -400,7 +427,6 @@ def embed(model: str, body: dict = Body(...)):
                 w2.inflight -= 1
 
         if r.status_code >= 400:
-            # (2) 区分 raw_model / canonical model，方便定位
             raise HTTPException(r.status_code, f"worker@{w.port} ({raw_model} -> {model}) -> {r.text}")
         return r.json()
     finally:
@@ -412,11 +438,10 @@ def metrics():
     with workers_lock:
         total = sum(len(v) for v in workers.values())
         flat = [
-            # (3) metrics 输出 canonical model，调试稳定；请求侧如需 raw_model，可从日志/HTTPException里看
-            {"model": w.model, "port": w.port, "inflight": w.inflight, "last_used": w.last_used}
+            {"model": w.model, "port": w.port, "pinned": bool(_is_pinned_model(w.model)), "inflight": w.inflight, "last_used": w.last_used}
             for arr in workers.values() for w in arr
         ]
-    return {"total": total, "workers": flat}
+    return {"total": total, "pinned_models": sorted(PINNED_MODELS), "workers": flat}
 
 
 def _evictor_loop():
@@ -432,6 +457,17 @@ def _evictor_loop():
 def _start_evictor():
     t = threading.Thread(target=_evictor_loop, daemon=True)
     t.start()
+
+    # ---- 预热常驻模型（不阻塞启动）----
+    def _prewarm():
+        for m in sorted(PINNED_MODELS):
+            try:
+                spawn_worker(m)
+            except Exception:
+                pass
+
+    if PINNED_MODELS:
+        threading.Thread(target=_prewarm, daemon=True).start()
 
 
 @app.post("/evict")

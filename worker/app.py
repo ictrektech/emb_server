@@ -3,23 +3,34 @@
 """
 Embedding worker (one model per process).
 
-Newly added:
+支持：
+- bge-m3 (FlagEmbedding)
+- bge-vl / baai/bge-vl-large (transformers trust_remote_code)
+- qwen3-embedding (SentenceTransformer)
+- siglip2-* (transformers)
+- openclip-vit-b-16-siglip2 (open_clip local-dir)
 - Immich ONNX SigLIP2 dual-encoder: immich-app/ViT-B-16-SigLIP2__webli
-  * text:  textual/model.onnx  input name: "text"  int32 [B, context_length]
-  * image: visual/model.onnx   input name: "image" float32 [B,3,H,W]
-  * tokenizer: textual/tokenizer.json (HuggingFace tokenizers format)
-  * preprocess: visual/preprocess_cfg.json
 
-Key fixes for your errors:
-- DO NOT enable TensorRT EP by default (it throws if TensorRT libs are not installed).
-- Prefer CUDAExecutionProvider when available; otherwise CPU.
+Immich ONNX 文件结构（repo 根目录）：
+- config.json
+- textual/model.onnx
+- textual/tokenizer.json
+- textual/tokenizer_config.json
+- visual/model.onnx
+- visual/preprocess_cfg.json
 
-Env knobs:
-- MODEL_NAME: which model to load (set by manager)
-- MODEL_ROOT: root folder for local models (default /root/models)
-- IMMICH_MODEL_DIR: if set and points to a directory that contains config.json/textual/visual, it will be used
-- IMMICH_HF_REPO: repo id for snapshot_download if local dir not present
-- HF_TOKEN: optional HF token for private repos
+关键修复：
+- 默认不启用 TensorrtExecutionProvider（没装 TRT 会直接报错）
+- 有 CUDAExecutionProvider 就用 CUDA + CPU fallback，否则纯 CPU
+
+环境变量：
+- MODEL_NAME / MODEL_ROOT
+- PINNED=1：启动时预热 load_model（manager 会给 pinned 模型设置）
+- IMMICH_MODEL_DIR：指向本地 immich 模型目录（包含上述文件结构）
+- IMMICH_HF_REPO：缺省 immich-app/ViT-B-16-SigLIP2__webli
+- HF_TOKEN：私有 repo 时可用
+- OPENCLIP_MODEL_DIR：openclip local-dir 路径
+- ORT_INTRA_OP_THREADS / ORT_INTER_OP_THREADS：onnxruntime 线程（0=默认）
 """
 
 import os
@@ -36,7 +47,6 @@ import torch
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 from PIL import Image
-
 import requests
 
 app = FastAPI()
@@ -45,26 +55,24 @@ app = FastAPI()
 MODEL_NAME = os.getenv("MODEL_NAME", "bge-m3").strip()
 MODEL_ROOT = os.getenv("MODEL_ROOT", "/root/models").strip()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+PINNED = os.getenv("PINNED", "0").strip() == "1"
 
-# OpenCLIP local dir (optional)
 OPENCLIP_MODEL_DIR = os.getenv("OPENCLIP_MODEL_DIR", "").strip()
 
-# Immich ONNX (optional overrides)
 IMMICH_HF_REPO = os.getenv("IMMICH_HF_REPO", "immich-app/ViT-B-16-SigLIP2__webli").strip()
 IMMICH_MODEL_DIR = os.getenv("IMMICH_MODEL_DIR", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
-# -------- In-process caches (lazy) --------
+# -------- Caches --------
 _model = None
-_processor = None  # transformers processor (siglip2)
+_processor = None
 _openclip_preprocess = None
 _openclip_tokenizer = None
 
-# Immich ONNX caches
 _immich_text_sess = None
 _immich_visual_sess = None
 _immich_tokenizer = None
-_immich_preprocess = None  # dict: size/mean/std/resampling
+_immich_preprocess = None
 _immich_context_len = None
 
 _start_lock = threading.Lock()
@@ -75,7 +83,7 @@ class TextBatch(BaseModel):
     batch: Optional[int] = 32
     max_length: Optional[int] = 8192
     normalize: Optional[bool] = True
-    prompt_name: Optional[str] = None  # for qwen3
+    prompt_name: Optional[str] = None  # qwen3 optional
 
 
 class VLItem(BaseModel):
@@ -91,16 +99,6 @@ class VLMixedBatch(BaseModel):
 
 # -------- Utils --------
 def _to_list(x):
-    """
-    将输入数据转换为Python列表形式
-
-    Args:
-        x (Union[torch.Tensor, np.ndarray, Any]): 输入数据，可以是PyTorch张量、NumPy数组或其他类型
-
-    Returns:
-        list: 转换后的Python列表。如果输入是张量或数组，会先将其转换为CPU上的Python列表；
-              如果是其他类型，则直接返回原值
-    """
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().tolist()
     if isinstance(x, np.ndarray):
@@ -109,17 +107,6 @@ def _to_list(x):
 
 
 def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """
-    对numpy数组在最后一个维度上进行L2归一化处理
-
-    Args:
-        x (np.ndarray): 输入的多维数组
-        eps (float, optional): 防止除以零的小值，默认为1e-12
-
-    Returns:
-        np.ndarray: 归一化后的数组，保持与输入相同的维度
-    """
-    """L2-normalize a numpy array on the last dimension."""
     x = x.astype(np.float32, copy=False)
     denom = np.linalg.norm(x, axis=-1, keepdims=True)
     denom = np.maximum(denom, eps)
@@ -139,15 +126,6 @@ _MIME_SUFFIX = {
 
 
 def _is_data_url(s: Optional[str]) -> bool:
-    """
-    检查字符串是否为有效的Base64数据URL格式
-
-    Args:
-        s (Optional[str]): 待检查的字符串，可能为None
-
-    Returns:
-        bool: 如果字符串是有效的Base64数据URL格式则返回True，否则返回False
-    """
     return isinstance(s, str) and s.startswith("data:") and ";base64," in s
 
 
@@ -157,15 +135,12 @@ def _save_data_url_to_tmp(data_url: str) -> str:
         raise HTTPException(400, "invalid data URL (expect data:<mime>;base64,...)")
     mime = m.group("mime").lower()
     b64 = m.group("b64")
-
     try:
         raw = base64.b64decode(b64, validate=True)
     except Exception as e:
         raise HTTPException(400, f"invalid base64 image data: {e}")
-
     if len(raw) > 64 * 1024 * 1024:
         raise HTTPException(413, "image too large (>64MB)")
-
     suffix = _MIME_SUFFIX.get(mime, ".img")
     fd, path = tempfile.mkstemp(prefix="img_", suffix=suffix)
     try:
@@ -181,13 +156,11 @@ def _save_data_url_to_tmp(data_url: str) -> str:
 
 
 def _load_pil_image_from_item(item: VLItem, tmp_files: List[str]) -> Image.Image:
-    # data URL first
     if item.image_base64 and _is_data_url(item.image_base64):
         p = _save_data_url_to_tmp(item.image_base64)
         tmp_files.append(p)
         return Image.open(p).convert("RGB")
 
-    # image_url
     if item.image_url:
         url = item.image_url
         if _is_data_url(url):
@@ -206,13 +179,11 @@ def _load_pil_image_from_item(item: VLItem, tmp_files: List[str]) -> Image.Image
             except Exception as e:
                 raise HTTPException(400, f"failed to decode image from url[{url}]: {e}")
 
-        # local path
         try:
             return Image.open(url).convert("RGB")
         except Exception as e:
             raise HTTPException(400, f"failed to open local image_url path[{url}]: {e}")
 
-    # image_path
     if item.image_path:
         try:
             return Image.open(item.image_path).convert("RGB")
@@ -233,21 +204,13 @@ def _is_immich_model(model_name: str) -> bool:
 
 
 def _hf_or_local_immich_dir() -> str:
-    """
-    Your tree matches what we expect:
-      config.json
-      textual/{model.onnx, tokenizer.json, tokenizer_config.json, ...}
-      visual/{model.onnx, preprocess_cfg.json, ...}
-    """
     if IMMICH_MODEL_DIR and os.path.isdir(IMMICH_MODEL_DIR):
         return IMMICH_MODEL_DIR
 
-    # Your suggested local name under MODEL_ROOT
     cand = os.path.join(MODEL_ROOT, "ViT-B-16-SigLIP2__webli")
     if os.path.isdir(cand):
         return cand
 
-    # Or last segment of repo id
     cand2 = os.path.join(MODEL_ROOT, IMMICH_HF_REPO.split("/")[-1])
     if os.path.isdir(cand2):
         return cand2
@@ -302,11 +265,12 @@ def _immich_image_to_tensor(img: Image.Image, cfg: Dict[str, Any]) -> np.ndarray
     arr = (arr - cfg["mean"]) / cfg["std"]
     arr = arr.transpose(2, 0, 1)  # CHW
     return arr.astype(np.float32)
+
+
 def _immich_select_ort_providers() -> List[str]:
     import onnxruntime as ort
     avail = ort.get_available_providers()
-
-    # Critical: DON'T add TensorrtExecutionProvider unless you *know* TRT libs are installed.
+    # Critical: DON'T add TensorrtExecutionProvider unless TRT libs are installed.
     if "CUDAExecutionProvider" in avail:
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
@@ -370,7 +334,6 @@ def _immich_load() -> None:
     pad_id = tok.token_to_id(pad_token)
 
     if pad_id is None:
-        # fallback candidates
         for t in (pad_token, "<|endoftext|>", "<pad>", "</s>", "<unk>"):
             pid = tok.token_to_id(t)
             if pid is not None:
@@ -397,23 +360,19 @@ def _immich_load() -> None:
 
 def _immich_encode_text(texts: List[str], normalize: bool) -> np.ndarray:
     _immich_load()
-    assert _immich_text_sess is not None and _immich_tokenizer is not None
-
     enc = _immich_tokenizer.encode_batch([(t or "").strip() for t in texts])
     ids = np.array([e.ids for e in enc], dtype=np.int32)
 
-    # Some exports are fixed-batch (=1). We try batched first; if ORT rejects dim0, fallback to per-item.
     def _run(ids_batch: np.ndarray) -> np.ndarray:
         out = _immich_text_sess.run(None, {"text": ids_batch})[0]
         return out.astype(np.float32)
 
-    vecs: np.ndarray
     try:
         vecs = _run(ids)
     except Exception as e:
-        msg = str(e)
-        # Typical error: "Got invalid dimensions ... Got: 4 Expected: 1"
-        if ("invalid dimensions" in msg.lower() and "expected: 1" in msg.lower()) or ("expected: 1" in msg):
+        # some exports fix batch=1; fallback per-sample
+        msg = str(e).lower()
+        if "invalid dimensions" in msg and "expected: 1" in msg:
             outs: List[np.ndarray] = []
             for i in range(ids.shape[0]):
                 out_i = _run(ids[i:i+1])[0]
@@ -429,10 +388,8 @@ def _immich_encode_text(texts: List[str], normalize: bool) -> np.ndarray:
 
 def _immich_encode_image(images: List[Image.Image], normalize: bool) -> np.ndarray:
     _immich_load()
-    assert _immich_visual_sess is not None and _immich_preprocess is not None
-
     xs = [_immich_image_to_tensor(img, _immich_preprocess) for img in images]
-    x = np.stack(xs, axis=0).astype(np.float32)
+    x = np.stack(xs, axis=0).astype(np.float32)  # [B,3,H,W]
 
     # Handle fixed batch dim (=1) exports
     try:
@@ -455,6 +412,7 @@ def _immich_encode_image(images: List[Image.Image], normalize: bool) -> np.ndarr
     return vecs
 
 
+# -------- Load models --------
 def load_model():
     global _model, _processor, _openclip_preprocess, _openclip_tokenizer
 
@@ -488,15 +446,6 @@ def load_model():
 
         if name in ["bge-vl", "baai/bge-vl", "baai/bge-vl-base", "baai/bge-vl-large"]:
             from transformers import AutoModel
-
-            if torch.cuda.is_available():
-                try:
-                    torch.backends.cuda.enable_flash_sdp(False)
-                    torch.backends.cuda.enable_mem_efficient_sdp(False)
-                    torch.backends.cuda.enable_math_sdp(True)
-                except Exception:
-                    pass
-
             base_path = os.path.join(MODEL_ROOT, "BGE-VL-base")
             large_path = os.path.join(MODEL_ROOT, "BGE-VL-large")
             mapping = {
@@ -506,7 +455,6 @@ def load_model():
                 "baai/bge-vl-large": large_path,
             }
             resolved = mapping.get(name, MODEL_NAME)
-
             target_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
             _model = AutoModel.from_pretrained(resolved, trust_remote_code=True, dtype=target_dtype)
             _model.set_processor(resolved)
@@ -525,11 +473,7 @@ def load_model():
             return
 
         if name in ["openclip-vit-b-16-siglip2", "openclip-siglip2-vit-b-16", "vit-b-16-siglip2"]:
-            try:
-                from open_clip import create_model_from_pretrained, get_tokenizer
-            except Exception as e:
-                raise RuntimeError(f"open_clip import failed (need open-clip-torch>=2.31.0): {e}")
-
+            from open_clip import create_model_from_pretrained, get_tokenizer
             candidates = []
             if OPENCLIP_MODEL_DIR:
                 candidates.append(OPENCLIP_MODEL_DIR)
@@ -576,6 +520,16 @@ def load_model():
 
 
 # -------- Routes --------
+@app.on_event("startup")
+def _startup_warm():
+    if PINNED or _is_immich_model(MODEL_NAME):
+        try:
+            load_model()
+        except Exception as e:
+            # 不崩 worker；/embed 时再抛详细错误
+            print(f"[worker] startup warm failed for MODEL_NAME={MODEL_NAME}: {e}", flush=True)
+
+
 @app.get("/health")
 def health():
     if _is_immich_model(MODEL_NAME):
@@ -585,18 +539,18 @@ def health():
                 "ok": True,
                 "model": MODEL_NAME,
                 "device": DEVICE,
+                "pinned": PINNED,
                 "onnxruntime_available_providers": ort.get_available_providers(),
             }
         except Exception:
-            return {"ok": True, "model": MODEL_NAME, "device": DEVICE}
-    return {"ok": True, "model": MODEL_NAME, "device": DEVICE}
+            return {"ok": True, "model": MODEL_NAME, "device": DEVICE, "pinned": PINNED}
+    return {"ok": True, "model": MODEL_NAME, "device": DEVICE, "pinned": PINNED}
 
 
 @app.post("/shutdown")
 def shutdown():
     import time as _time
     import os as _os
-
     global _model, _processor, _openclip_preprocess, _openclip_tokenizer
     global _immich_text_sess, _immich_visual_sess, _immich_tokenizer, _immich_preprocess, _immich_context_len
 
@@ -632,7 +586,7 @@ def shutdown():
 def embed(body: Dict[str, Any] = Body(...)):
     load_model()
 
-    # --- Immich ONNX ---
+    # ---------- Immich ONNX ----------
     if _is_immich_model(MODEL_NAME):
         inputs = body.get("input", None)
         if not isinstance(inputs, list) or not inputs:
@@ -642,8 +596,7 @@ def embed(body: Dict[str, Any] = Body(...)):
         if isinstance(inputs[0], str):
             vecs = _immich_encode_text([str(x) for x in inputs], normalize=normalize)
             out = _to_list(vecs)
-            dim = len(out[0]) if out else 0
-            return {"embeddings": out, "dim": dim, "model": MODEL_NAME, "modality": "text", "backend": "onnxruntime"}
+            return {"embeddings": out, "dim": (len(out[0]) if out else 0), "model": MODEL_NAME, "modality": "text", "backend": "onnxruntime"}
 
         tmp_files: List[str] = []
         try:
@@ -657,8 +610,7 @@ def embed(body: Dict[str, Any] = Body(...)):
                 images.append(_load_pil_image_from_item(item, tmp_files))
             vecs = _immich_encode_image(images, normalize=normalize)
             out = _to_list(vecs)
-            dim = len(out[0]) if out else 0
-            return {"embeddings": out, "dim": dim, "model": MODEL_NAME, "modality": "image", "backend": "onnxruntime"}
+            return {"embeddings": out, "dim": (len(out[0]) if out else 0), "model": MODEL_NAME, "modality": "image", "backend": "onnxruntime"}
         finally:
             for p in tmp_files:
                 try:
@@ -667,9 +619,8 @@ def embed(body: Dict[str, Any] = Body(...)):
                 except Exception:
                     pass
 
-    # --- Everything else ---
+    # ---------- bge-m3 ----------
     name = MODEL_NAME.lower()
-
     if name in ["bge-m3", "baai/bge-m3"]:
         try:
             args = TextBatch(**body)
@@ -689,6 +640,7 @@ def embed(body: Dict[str, Any] = Body(...)):
         out = _to_list(out)
         return {"embeddings": out, "dim": (len(out[0]) if out else 0), "model": MODEL_NAME, "modality": "text"}
 
+    # ---------- qwen3-embedding ----------
     if name in [
         "qwen", "qwen-embedding", "qwen3-embedding",
         "qwen/qwen3-embedding-0.6b", "qwen3-embedding-0.6b"
@@ -723,6 +675,7 @@ def embed(body: Dict[str, Any] = Body(...)):
         vecs = _to_list(vecs)
         return {"embeddings": vecs, "dim": (len(vecs[0]) if vecs else 0), "model": MODEL_NAME, "modality": "text"}
 
+    # ---------- openclip-vit-b-16-siglip2 ----------
     if name in ["openclip-vit-b-16-siglip2", "openclip-siglip2-vit-b-16", "vit-b-16-siglip2"]:
         if _openclip_preprocess is None or _openclip_tokenizer is None:
             raise HTTPException(500, "OpenCLIP preprocess/tokenizer not initialized")
@@ -775,6 +728,7 @@ def embed(body: Dict[str, Any] = Body(...)):
                 except Exception:
                     pass
 
+    # ---------- siglip2-* ----------
     if name.startswith("siglip2-"):
         if _processor is None:
             raise HTTPException(500, "SigLip2 processor not initialized")
@@ -823,7 +777,7 @@ def embed(body: Dict[str, Any] = Body(...)):
                 except Exception:
                     pass
 
-    # fallback: bge-vl mixed encode
+    # ---------- bge-vl mixed encode (fallback) ----------
     try:
         batch = VLMixedBatch(**body)
     except Exception as e:
@@ -833,6 +787,7 @@ def embed(body: Dict[str, Any] = Body(...)):
 
     results: List[List[float]] = []
     tmp_files: List[str] = []
+
     with torch.inference_mode():
         try:
             for item in batch.input:
