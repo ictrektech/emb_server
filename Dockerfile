@@ -25,8 +25,10 @@ RUN pip3 install -U --no-cache-dir transformers FlagEmbedding uvicorn fastapi op
 WORKDIR /app
 COPY manager/ /app/manager/
 COPY worker/ /app/worker/
+COPY start.sh /app/
 
 # 默认启动 Manager
 ENV HOST=0.0.0.0 PORT=18000
 EXPOSE 18000
-CMD ["uvicorn", "manager.app:app", "--host", "0.0.0.0", "--port", "18000"]
+# CMD ["uvicorn", "manager.app:app", "--host", "0.0.0.0", "--port", "18000"]
+CMD ["/app/start.sh"]
