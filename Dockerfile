@@ -2,6 +2,7 @@
 FROM python:3.12-slim
 
 ARG PROXY=""
+ARG USE_OLD_TRANSFORMERS=0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -20,7 +21,12 @@ RUN apt-get update && apt-get install -y python3 python3-pip git ffmpeg libglib2
 RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple
 RUN pip3 config set install.trusted-host mirrors.aliyun.com
 RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
-RUN pip3 install -U --no-cache-dir transformers FlagEmbedding uvicorn fastapi open-clip-torch timm onnxruntime
+RUN if [ "$USE_OLD_TRANSFORMERS" = "1" ]; then \
+        pip3 install -U --no-cache-dir "transformers>=4.40,<4.45"; \
+    else \
+        pip3 install -U --no-cache-dir transformers; \
+    fi && \
+    pip3 install -U --no-cache-dir FlagEmbedding uvicorn fastapi open-clip-torch timm onnxruntime
 
 WORKDIR /app
 COPY manager/ /app/manager/

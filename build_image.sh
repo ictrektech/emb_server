@@ -63,6 +63,11 @@ if [[ -n "${PROXY:-}" ]]; then
   BUILD_ARGS+=(--build-arg "PROXY=${PROXY}")
 fi
 
+if [[ -n "${USE_OLD_TRANSFORMERS:-}" ]]; then
+  echo "Using USE_OLD_TRANSFORMERS=${USE_OLD_TRANSFORMERS}"
+  BUILD_ARGS+=(--build-arg "USE_OLD_TRANSFORMERS=${USE_OLD_TRANSFORMERS}")
+fi
+
 # 获取日期
 DATE=$(date +%Y%m%d)
 
