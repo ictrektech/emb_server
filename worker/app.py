@@ -48,6 +48,23 @@ from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 from PIL import Image
 import requests
+# --- transformers 5.x compatibility patch for older FlagEmbedding ---
+try:
+    import transformers
+    from transformers.utils import import_utils as _hf_import_utils
+
+    if not hasattr(_hf_import_utils, "is_torch_fx_available"):
+        def is_torch_fx_available() -> bool:
+            try:
+                import torch
+                # torch.fx exists since torch 1.8+, but be defensive
+                return hasattr(torch, "fx")
+            except Exception:
+                return False
+
+        _hf_import_utils.is_torch_fx_available = is_torch_fx_available
+except Exception:
+    pass
 
 app = FastAPI()
 
