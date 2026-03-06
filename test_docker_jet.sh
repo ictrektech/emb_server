@@ -16,8 +16,8 @@ docker run -dit \
   -e IDLE_TIMEOUT_S=900 \
   -e MODEL_PORT_BASE=18008 \
   -e PYTHON_BIN=python3 \
-  -e PRELOAD_MODELS=vit-b-16-siglip2__webli \
-  -e PIN_MODELS=vit-b-16-siglip2__webli \
+  -e PINNED_MODELS=vit-b-16-siglip2__webli \
   -v /home/jhu/dev/models/embs:/root/models \
   -v /home/jhu/dev/media:/root/media \
+  -v /etc/localtime:/etc/localtime:ro \
   emb_server
