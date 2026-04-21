@@ -27,11 +27,12 @@ case "$(uname -m)" in
 esac
 
 declare -A PROFILE_TO_SHEET_TITLE=(
-  ["Dockerfile"]="ARM_without_cuda"
+  ["Dockerfile"]="${CUDA_PREFIX}_without_cuda"
   ["Dockerfile_l4t"]="l4t"
   ["Dockerfile_cu124"]="${CUDA_PREFIX}_with_cuda"
   ["Dockerfile_cu128"]="${CUDA_PREFIX}_with_cuda"
 )
+
 
 # -------------------------
 # 基础函数
@@ -339,6 +340,29 @@ case "$ARCH" in
     ;;
 esac
 
+if [[ "$ARCH" == "aarch64" ]]; then
+  MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "")
+
+  if [[ -f "/etc/nv_tegra_release" ]]; then
+    # Jetson（Orin / NX / Xavier）
+    P="l4t"
+
+  elif echo "$MODEL" | grep -qi "thor"; then
+    # Thor
+    P="arm"
+
+  else
+    # 普通 ARM
+    P="arm"
+  fi
+
+elif [[ "$ARCH" == "x86_64" ]]; then
+  P="amd"
+
+else
+  P="unknown"
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile)
@@ -354,17 +378,37 @@ done
 
 case "$PROFILE" in
   Dockerfile)
-    PROFILE_TAG="${ARCH_TAG}"
+    if [[ "$P" == "l4t" ]]; then
+      PROFILE_TAG="arm"
+    else
+      PROFILE_TAG="${P}"
+    fi
     ;;
-  Dockerfile_cu124)
-    PROFILE_TAG="${ARCH_TAG}_cu124"
-    ;;
-  Dockerfile_cu128)
-    PROFILE_TAG="${ARCH_TAG}_cu128"
-    ;;
+
   Dockerfile_l4t)
-    PROFILE_TAG="${ARCH_TAG}_l4t"
+    if [[ "$P" == "l4t" ]]; then
+      PROFILE_TAG="l4t"
+    else
+      PROFILE_TAG="${P}_l4t"
+    fi
     ;;
+
+  Dockerfile_cu124)
+    if [[ "$P" == "amd" ]]; then
+      PROFILE_TAG="amd_cu124"
+    else
+      PROFILE_TAG="arm_cu124"
+    fi
+    ;;
+
+  Dockerfile_cu128)
+    if [[ "$P" == "amd" ]]; then
+      PROFILE_TAG="amd_cu128"
+    else
+      PROFILE_TAG="arm_cu128"
+    fi
+    ;;
+
   *)
     echo "Unsupported profile: $PROFILE"
     exit 1
