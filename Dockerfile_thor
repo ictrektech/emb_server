@@ -1,0 +1,68 @@
+# Dockerfile
+FROM nvcr.io/nvidia/pytorch:25.08-py3
+
+ARG PROXY
+ARG USE_OLD_TRANSFORMERS=0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TRANSFORMERS_CACHE=/workspace/.hf \
+    HF_HOME=/workspace/.hf \
+    HF_ENDPOINT=https://hf-mirror.com \
+    TZ=Asia/Shanghai
+
+COPY modules/ /app/modules/
+
+RUN chmod 1777 /tmp && apt-get update && apt-get install -y \
+    curl wget ca-certificates \
+    tar \
+    &&  update-ca-certificates && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && \
+    apt-get install -y tzdata && \
+    ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
+    dpkg-reconfigure -f noninteractive tzdata && \
+    apt-get clean
+
+RUN apt-get update && apt-get install -y git ffmpeg libglib2.0-0 libsm6 libxrender1 libxext6
+# RUN apt-get update && apt-get install -y python3 python3-pip git ffmpeg libglib2.0-0 libsm6 libxrender1 libxext6 libopenblas0-pthread libopenblas-dev
+
+RUN pip3 config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple
+RUN pip3 config set install.trusted-host mirrors.ustc.edu.cn
+
+RUN set -e; \
+    if [ "$USE_OLD_TRANSFORMERS" = "1" ]; then \
+      pip install --no-cache-dir open-clip-torch timm "transformers>=4.40,<4.45" FlagEmbedding uvicorn fastapi numpy==1.26.4 \
+        --timeout 120 --retries 5 \
+        --upgrade-strategy only-if-needed \
+        --break-system-packages; \
+    else \
+      pip install --no-cache-dir open-clip-torch timm transformers FlagEmbedding uvicorn fastapi numpy==1.26.4 \
+        --index-url https://mirrors.aliyun.com/pypi/simple \
+        --trusted-host mirrors.aliyun.com/pypi/simple \
+        --timeout 120 --retries 5 \
+        --upgrade-strategy only-if-needed \
+        --break-system-packages; \
+    fi
+
+RUN set -e; \
+    if [ -n "${PROXY}" ]; then \
+      echo "Using PROXY=${PROXY} for pip"; \
+      export HTTP_PROXY="${PROXY}" HTTPS_PROXY="${PROXY}" http_proxy="${PROXY}" https_proxy="${PROXY}"; \
+      export NO_PROXY="localhost,127.0.0.1" no_proxy="localhost,127.0.0.1"; \
+    fi; \
+    pip3 install --force-reinstall --no-deps /app/modules/onnxruntime_gpu-1.27.0-cp312-cp312-linux_aarch64.whl
+
+
+WORKDIR /app
+COPY manager/ /app/manager/
+COPY worker/ /app/worker/
+
+COPY start.sh /app/
+
+# 默认启动 Manager
+ENV HOST=0.0.0.0 PORT=18000
+EXPOSE 18000
+CMD ["/app/start.sh"]
