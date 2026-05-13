@@ -14,6 +14,7 @@ emb_server/
 ├── Dockerfile_l4t    # Jetson (L4T) 镜像
 ├── Dockerfile_cu124  # CUDA 12.4 镜像
 ├── Dockerfile_cu128  # CUDA 12.8 镜像
+├── Dockerfile_thor   # Thor (ARM + CUDA) 镜像
 ├── build_image.sh    # 构建并推送镜像（自动写飞书版本表）
 ├── start.sh          # 容器入口脚本
 └── dc.yml            # docker-compose 配置
@@ -34,6 +35,7 @@ emb_server/
 ./build_image.sh --profile Dockerfile_cu124
 ./build_image.sh --profile Dockerfile_cu128
 ./build_image.sh --profile Dockerfile_l4t
+./build_image.sh --profile Dockerfile_thor
 ```
 
 ### 可选环境变量
@@ -57,6 +59,7 @@ swr.cn-southwest-2.myhuaweicloud.com/ictrek/emb_server:<PROFILE_TAG>_<VERSION>_<
 | `Dockerfile_l4t` | `amd_l4t` | `l4t` | `arm_l4t` |
 | `Dockerfile_cu124` | `amd_cu124` | - | `arm_cu124` |
 | `Dockerfile_cu128` | `amd_cu128` | - | `arm_cu128` |
+| `Dockerfile_thor` | `thor` | `thor` | `thor` |
 
 若项目根目录存在 `VERSION` 文件，标签中会包含版本号；否则仅用日期。
 
@@ -70,6 +73,7 @@ swr.cn-southwest-2.myhuaweicloud.com/ictrek/emb_server:<PROFILE_TAG>_<VERSION>_<
 | `Dockerfile_cu124` | AMD_with_cuda | ARM_with_cuda |
 | `Dockerfile_cu128` | AMD_with_cuda | ARM_with_cuda |
 | `Dockerfile_l4t` | l4t | l4t |
+| `Dockerfile_thor` | thor_spark | thor_spark |
 
 ### 前置依赖
 
