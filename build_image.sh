@@ -31,6 +31,7 @@ declare -A PROFILE_TO_SHEET_TITLE=(
   ["Dockerfile_l4t"]="l4t"
   ["Dockerfile_cu124"]="${CUDA_PREFIX}_with_cuda"
   ["Dockerfile_cu128"]="${CUDA_PREFIX}_with_cuda"
+  ["Dockerfile_thor"]="thor_spark"
 )
 
 
@@ -407,6 +408,10 @@ case "$PROFILE" in
     else
       PROFILE_TAG="arm_cu128"
     fi
+    ;;
+
+  Dockerfile_thor)
+    PROFILE_TAG="thor"
     ;;
 
   *)
