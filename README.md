@@ -56,10 +56,10 @@ swr.cn-southwest-2.myhuaweicloud.com/ictrek/emb_server:<PROFILE_TAG>_<VERSION>_<
 | Profile | x86_64 标签后缀 | aarch64 (Jetson) 标签后缀 | aarch64 (其他) 标签后缀 |
 |---------|----------------|--------------------------|----------------------|
 | `Dockerfile` | `amd` | `arm` | `arm` |
-| `Dockerfile_l4t` | `amd_l4t` | `l4t` | `arm_l4t` |
+| `Dockerfile_l4t` | - | `l4t` | `arm_l4t` |
 | `Dockerfile_cu124` | `amd_cu124` | - | `arm_cu124` |
 | `Dockerfile_cu128` | `amd_cu128` | - | `arm_cu128` |
-| `Dockerfile_thor` | `thor` | `thor` | `thor` |
+| `Dockerfile_thor` | - | - | `thor` |
 
 若项目根目录存在 `VERSION` 文件，标签中会包含版本号；否则仅用日期。
 
