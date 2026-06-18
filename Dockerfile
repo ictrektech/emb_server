@@ -42,7 +42,7 @@ RUN if [ "$USE_OLD_TRANSFORMERS" = "1" ]; then \
     else \
         pip3 install -U --no-cache-dir transformers; \
     fi && \
-    pip3 install -U --no-cache-dir FlagEmbedding uvicorn fastapi open-clip-torch timm onnxruntime
+    pip3 install -U --no-cache-dir FlagEmbedding uvicorn fastapi python-multipart open-clip-torch timm onnxruntime
 
 WORKDIR /app
 COPY manager/ /app/manager/

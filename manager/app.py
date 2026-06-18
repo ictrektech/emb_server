@@ -3,11 +3,13 @@ import os
 import time
 import subprocess
 import requests
+import json
 from typing import Dict, List
 import threading
 from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, File, Form, UploadFile
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 # -------- 配置 --------
@@ -20,7 +22,8 @@ EVICTOR_INTERVAL_S = int(os.getenv("EVICTOR_INTERVAL_S", 60))  # 每 60s 扫一�
 
 # -------- 常驻模型（逗号分隔）--------
 # 示例：PINNED_MODELS=vit-b-16-siglip2__webli,openclip-vit-b-16-siglip2
-PINNED_MODELS_RAW = [s.strip() for s in os.getenv("PINNED_MODELS", "").split(",") if s.strip()]
+PINNED_MODELS_ENV = os.getenv("PINNED_MODELS", os.getenv("PIN_MODELS", os.getenv("PRELOAD_MODELS", "")))
+PINNED_MODELS_RAW = [s.strip() for s in PINNED_MODELS_ENV.split(",") if s.strip()]
 
 # 声明可用模型（用于白名单 & 类型标注）
 MODEL_SPECS: Dict[str, Dict] = {
@@ -90,7 +93,30 @@ def canonical_model_name(model: str) -> str:
         "openclip-siglip2-vit-b-16": "openclip-vit-b-16-siglip2",
         "vit-b-16-siglip2": "openclip-vit-b-16-siglip2",
     }
-    return alias.get(m, model)
+    return alias.get(m, m)
+
+
+def _parse_immich_predict_entries(entries: str) -> Dict:
+    try:
+        parsed = json.loads(entries)
+    except Exception as e:
+        raise HTTPException(422, f"Invalid request format: {e}")
+    if not isinstance(parsed, dict):
+        raise HTTPException(422, "Invalid request format: entries must be a JSON object")
+    return parsed
+
+
+def _model_from_immich_entries(entries: str) -> str:
+    parsed = _parse_immich_predict_entries(entries)
+    clip = parsed.get("clip")
+    if not isinstance(clip, dict):
+        unsupported = ", ".join(str(k) for k in parsed.keys()) or "<empty>"
+        raise HTTPException(400, f"Only Immich CLIP prediction is supported; got: {unsupported}")
+
+    entry = clip.get("visual") if "visual" in clip else clip.get("textual")
+    if not isinstance(entry, dict) or not entry.get("modelName"):
+        raise HTTPException(422, "Invalid Immich CLIP request: clip.visual/textual.modelName is required")
+    return canonical_model_name(str(entry["modelName"]))
 
 
 # -------- 常驻判断（基于 canonical）--------
@@ -428,6 +454,74 @@ def embed(model: str, body: dict = Body(...)):
 
         if r.status_code >= 400:
             raise HTTPException(r.status_code, f"worker@{w.port} ({raw_model} -> {model}) -> {r.text}")
+        return r.json()
+    finally:
+        w.inflight -= 1
+
+
+@app.get("/ping")
+def ping():
+    return PlainTextResponse("pong")
+
+
+@app.post("/predict")
+async def immich_predict(
+    entries: str = Form(...),
+    image: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+):
+    model = _model_from_immich_entries(entries)
+    if model not in MODEL_SPECS:
+        raise HTTPException(404, f"Unknown model {model}")
+
+    w = pick_worker(model)
+    w.inflight += 1
+    try:
+        data = {"entries": entries}
+        if text is not None:
+            data["text"] = text
+
+        files = None
+        if image is not None:
+            raw = await image.read()
+            files = {
+                "image": (
+                    image.filename or "image",
+                    raw,
+                    image.content_type or "application/octet-stream",
+                )
+            }
+
+        try:
+            r = requests.post(f"http://127.0.0.1:{w.port}/predict", data=data, files=files, timeout=120)
+        except requests.exceptions.ConnectionError:
+            try:
+                requests.post(f"http://127.0.0.1:{w.port}/shutdown", timeout=0.5)
+            except Exception:
+                pass
+            try:
+                w.proc.terminate()
+            except Exception:
+                pass
+            with workers_lock:
+                try:
+                    if w.model in workers and w in workers[w.model]:
+                        workers[w.model].remove(w)
+                        if not workers[w.model]:
+                            workers.pop(w.model, None)
+                except Exception:
+                    pass
+                port_alloc.discard(w.port)
+
+            w2 = spawn_worker(model)
+            w2.inflight += 1
+            try:
+                r = requests.post(f"http://127.0.0.1:{w2.port}/predict", data=data, files=files, timeout=120)
+            finally:
+                w2.inflight -= 1
+
+        if r.status_code >= 400:
+            raise HTTPException(r.status_code, f"worker@{w.port} ({model}) -> {r.text}")
         return r.json()
     finally:
         w.inflight -= 1

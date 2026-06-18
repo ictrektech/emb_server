@@ -101,11 +101,181 @@ docker compose -f dc.yml up
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `MODEL_ROOT` | `/root/models` | 模型文件根目录 |
-| `PRELOAD_MODELS` | `vit-b-16-siglip2__webli` | 启动时预加载的模型 |
-| `PIN_MODELS` | `vit-b-16-siglip2__webli` | 常驻不卸载的模型 |
+| `PINNED_MODELS` | `vit-b-16-siglip2__webli` | 常驻并启动预热的模型，逗号分隔 |
+| `PIN_MODELS` | `vit-b-16-siglip2__webli` | 旧变量名，未设置 `PINNED_MODELS` 时兼容读取 |
+| `PRELOAD_MODELS` | `vit-b-16-siglip2__webli` | 旧变量名，未设置 `PINNED_MODELS` / `PIN_MODELS` 时兼容读取 |
 | `MODEL_PORT_BASE` | `18008` | Worker 端口起始值 |
 | `MAX_WORKERS` | `3` | 全局最大并发 Worker 数 |
 | `PER_MODEL_MAX` | `2` | 单模型最大副本数 |
 | `IDLE_TIMEOUT_S` | `900` | 空闲超时秒数（超时自动卸载） |
 | `EVICTOR_INTERVAL_S` | `60` | 驱逐检查间隔 |
 | `PORT` | `18000` | 网关监听端口 |
+| `IMMICH_MODEL_DIR` | 空 | Immich ONNX 模型目录，包含 `config.json`、`textual/`、`visual/` |
+| `IMMICH_HF_REPO` | `immich-app/ViT-B-16-SigLIP2__webli` | 本地目录不存在时下载的 Hugging Face repo |
+| `HF_TOKEN` | 空 | Hugging Face 私有模型 token |
+| `OPENCLIP_MODEL_DIR` | 空 | OpenCLIP `local-dir:` 模型目录 |
+| `ORT_INTRA_OP_THREADS` | `0` | ONNX Runtime intra-op 线程数，`0` 为默认 |
+| `ORT_INTER_OP_THREADS` | `0` | ONNX Runtime inter-op 线程数，`0` 为默认 |
+
+## 支持的模型
+
+| 模型名 / 别名 | 类型 | 后端 | 说明 |
+|---------------|------|------|------|
+| `vit-b-16-siglip2__webli` | 图文 | ONNX Runtime | Immich `ViT-B-16-SigLIP2__webli` 双塔模型，推荐用于 Immich 接入 |
+| `immich-vit-b-16-siglip2__webli` | 图文 | ONNX Runtime | `vit-b-16-siglip2__webli` 别名 |
+| `immich-app/vit-b-16-siglip2__webli` | 图文 | ONNX Runtime | `vit-b-16-siglip2__webli` 别名 |
+| `immich-app/vit-b-16-siglip2__webli@onnx` | 图文 | ONNX Runtime | `vit-b-16-siglip2__webli` 别名 |
+| `bge-m3` / `baai/bge-m3` | 文本 | FlagEmbedding | dense embedding |
+| `qwen` / `qwen-embedding` / `qwen3-embedding` / `qwen3-embedding-0.6b` / `qwen/qwen3-embedding-0.6b` | 文本 | SentenceTransformer | Qwen3 embedding |
+| `bge-vl` / `baai/bge-vl` / `baai/bge-vl-base` / `baai/bge-vl-large` | 图文 | Transformers | BGE-VL |
+| `openclip-vit-b-16-siglip2` / `openclip-siglip2-vit-b-16` / `vit-b-16-siglip2` | 图文 | open_clip | OpenCLIP local-dir 模型 |
+| `siglip2-base-patch16-224` / `256` / `384` / `512` | 图文 | Transformers | Google SigLIP2 base |
+| `siglip2-large-patch16-256` / `384` / `512` | 图文 | Transformers | Google SigLIP2 large |
+
+## API 用法
+
+### 健康检查
+
+```bash
+curl http://127.0.0.1:18000/ping
+curl http://127.0.0.1:18000/metrics
+```
+
+`/ping` 返回 `pong`，用于 Immich Machine Learning URL 健康检查；`/metrics` 返回已加载 worker、常驻模型和并发状态。
+
+### 通用文本 embedding
+
+```bash
+curl -X POST 'http://127.0.0.1:18000/embed?model=bge-m3' \
+  -H 'Content-Type: application/json' \
+  -d '{"input":["hello world","你好世界"],"normalize":true,"batch":32}'
+```
+
+返回：
+
+```json
+{
+  "embeddings": [[0.1, 0.2]],
+  "dim": 1024,
+  "model": "bge-m3",
+  "modality": "text"
+}
+```
+
+### Qwen3 embedding
+
+```bash
+curl -X POST 'http://127.0.0.1:18000/embed?model=qwen3-embedding-0.6b' \
+  -H 'Content-Type: application/json' \
+  -d '{"input":["query text"],"normalize":true,"prompt_name":"query"}'
+```
+
+### 图文模型的文本 embedding
+
+```bash
+curl -X POST 'http://127.0.0.1:18000/embed?model=vit-b-16-siglip2__webli' \
+  -H 'Content-Type: application/json' \
+  -d '{"input":["a dog on the beach"],"normalize":true}'
+```
+
+### 图文模型的图片 embedding
+
+```bash
+curl -X POST 'http://127.0.0.1:18000/embed?model=vit-b-16-siglip2__webli' \
+  -H 'Content-Type: application/json' \
+  -d '{"input":[{"image_path":"/root/images/demo.jpg"}],"normalize":true}'
+```
+
+图片输入支持：
+
+| 字段 | 说明 |
+|------|------|
+| `image_path` | 容器内本地图片路径 |
+| `image_url` | HTTP/HTTPS URL、本地路径或 `data:<mime>;base64,...` |
+| `image_base64` | `data:<mime>;base64,...` |
+| `text` | BGE-VL mixed encode 可同时传文本 |
+
+### OpenCLIP / Transformers SigLIP2
+
+```bash
+curl -X POST 'http://127.0.0.1:18000/embed?model=openclip-vit-b-16-siglip2' \
+  -H 'Content-Type: application/json' \
+  -d '{"input":["a photo of a train"],"normalize":true}'
+
+curl -X POST 'http://127.0.0.1:18000/embed?model=siglip2-base-patch16-256' \
+  -H 'Content-Type: application/json' \
+  -d '{"input":[{"image_url":"https://example.com/image.jpg"}],"normalize":true}'
+```
+
+### Immich 兼容接入
+
+将 Immich 的 Machine Learning URL 指向 emb_server 网关：
+
+```bash
+IMMICH_MACHINE_LEARNING_URL=http://emb_server:18000
+```
+
+emb_server 支持 Immich 对 CLIP 图片和文字 embedding 的接口要求：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/ping` | 返回 `pong` |
+| `POST` | `/predict` | `multipart/form-data`，字段为 `entries` 加 `image` 或 `text` |
+
+文字 embedding 请求：
+
+```bash
+curl -X POST http://127.0.0.1:18000/predict \
+  -F 'entries={"clip":{"textual":{"modelName":"ViT-B-16-SigLIP2__webli","options":{"language":"zh-Hans"}}}}' \
+  -F 'text=一张海边列车的照片'
+```
+
+返回格式：
+
+```json
+{
+  "clip": "[0.1,0.2,...]"
+}
+```
+
+图片 embedding 请求：
+
+```bash
+curl -X POST http://127.0.0.1:18000/predict \
+  -F 'entries={"clip":{"visual":{"modelName":"ViT-B-16-SigLIP2__webli"}}}' \
+  -F 'image=@/path/to/demo.jpg'
+```
+
+返回格式：
+
+```json
+{
+  "clip": "[0.1,0.2,...]",
+  "imageHeight": 1080,
+  "imageWidth": 1920
+}
+```
+
+说明：
+
+- Immich 兼容输出中的 `clip` 是 JSON 数组字符串，和 Immich 原生 ML 服务一致。
+- `/predict` 默认不额外 L2 normalize，以贴近 Immich 原生 ONNX 输出；通用 `/embed` 默认 `normalize=true`。
+- 当前 `/predict` 只实现 CLIP `visual` / `textual`，不处理 face embedding 和 OCR。
+
+## tc232 测试示例
+
+tc232 上已有模型目录 `/home/jhu/dev/models/embs`，可用 CUDA 12.8 profile 构建/运行：
+
+```bash
+ssh tc232
+cd /path/to/emb_server
+docker build -f Dockerfile_cu128 -t emb_server:cu128 .
+docker run --rm --gpus all \
+  -p 18000:18000 \
+  -v /home/jhu/dev/models/embs:/root/models:ro \
+  -e MODEL_ROOT=/root/models \
+  -e PINNED_MODELS=vit-b-16-siglip2__webli \
+  emb_server:cu128
+```
+
+启动后可用 `/ping`、`/embed?model=vit-b-16-siglip2__webli` 和 `/predict` 验证。

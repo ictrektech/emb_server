@@ -8,6 +8,7 @@ export MODEL_ROOT="${MODEL_ROOT:-/root/models}"
 # 如果外部没传，就默认 vit-b-16-siglip2__webli
 export PRELOAD_MODELS="${PRELOAD_MODELS:-vit-b-16-siglip2__webli}"
 export PIN_MODELS="${PIN_MODELS:-vit-b-16-siglip2__webli}"
+export PINNED_MODELS="${PINNED_MODELS:-$PIN_MODELS}"
 
 # 其它参数也允许外部覆盖
 export MODEL_PORT_BASE="${MODEL_PORT_BASE:-18008}"

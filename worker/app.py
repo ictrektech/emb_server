@@ -44,7 +44,8 @@ from typing import List, Optional, Dict, Any
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, File, Form, UploadFile
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from PIL import Image
 import requests
@@ -121,6 +122,11 @@ def _to_list(x):
     if isinstance(x, np.ndarray):
         return x.tolist()
     return x
+
+
+def _to_immich_embedding(vec: np.ndarray) -> str:
+    arr = np.asarray(vec, dtype=np.float32)
+    return json.dumps(arr.tolist(), ensure_ascii=False, separators=(",", ":"))
 
 
 def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -429,6 +435,38 @@ def _immich_encode_image(images: List[Image.Image], normalize: bool) -> np.ndarr
     return vecs
 
 
+def _parse_immich_predict_entries(entries: str) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(entries)
+    except Exception as e:
+        raise HTTPException(422, f"Invalid request format: {e}")
+    if not isinstance(parsed, dict):
+        raise HTTPException(422, "Invalid request format: entries must be a JSON object")
+    return parsed
+
+
+def _get_immich_clip_entry(entries: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    clip = entries.get("clip")
+    if not isinstance(clip, dict):
+        unsupported = ", ".join(str(k) for k in entries.keys()) or "<empty>"
+        raise HTTPException(400, f"Only Immich CLIP prediction is supported by this worker; got: {unsupported}")
+
+    if "visual" in clip:
+        modality = "visual"
+    elif "textual" in clip:
+        modality = "textual"
+    else:
+        raise HTTPException(422, "Invalid Immich CLIP request: expected clip.visual or clip.textual")
+
+    entry = clip.get(modality)
+    if not isinstance(entry, dict) or not entry.get("modelName"):
+        raise HTTPException(422, f"Invalid Immich CLIP request: clip.{modality}.modelName is required")
+
+    if not _is_immich_model(str(entry["modelName"])):
+        raise HTTPException(400, f"Unsupported Immich CLIP model: {entry['modelName']}")
+    return modality, entry
+
+
 # -------- Load models --------
 def load_model():
     global _model, _processor, _openclip_preprocess, _openclip_tokenizer
@@ -562,6 +600,11 @@ def health():
         except Exception:
             return {"ok": True, "model": MODEL_NAME, "device": DEVICE, "pinned": PINNED}
     return {"ok": True, "model": MODEL_NAME, "device": DEVICE, "pinned": PINNED}
+
+
+@app.get("/ping")
+def ping():
+    return PlainTextResponse("pong")
 
 
 @app.post("/shutdown")
@@ -845,3 +888,41 @@ def embed(body: Dict[str, Any] = Body(...)):
                     pass
 
     return {"embeddings": results, "dim": (len(results[0]) if results else 0), "model": MODEL_NAME}
+
+
+@app.post("/predict")
+async def immich_predict(
+    entries: str = Form(...),
+    image: Optional[UploadFile] = File(default=None),
+    text: Optional[str] = Form(default=None),
+):
+    if not _is_immich_model(MODEL_NAME):
+        raise HTTPException(400, f"Immich /predict is only available for Immich CLIP models; current MODEL_NAME={MODEL_NAME}")
+
+    load_model()
+    parsed = _parse_immich_predict_entries(entries)
+    modality, entry = _get_immich_clip_entry(parsed)
+    options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+    normalize = bool(options.get("normalize", False))
+
+    if modality == "textual":
+        if text is None:
+            raise HTTPException(400, "text must be provided for clip.textual")
+        vec = _immich_encode_text([text], normalize=normalize)[0]
+        return {"clip": _to_immich_embedding(vec)}
+
+    if image is None:
+        raise HTTPException(400, "image must be provided for clip.visual")
+    raw = await image.read()
+    try:
+        pil = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(400, f"failed to decode image: {e}")
+
+    image_width, image_height = pil.size
+    vec = _immich_encode_image([pil], normalize=normalize)[0]
+    return {
+        "clip": _to_immich_embedding(vec),
+        "imageHeight": image_height,
+        "imageWidth": image_width,
+    }
