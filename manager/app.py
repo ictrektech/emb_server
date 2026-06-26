@@ -27,33 +27,32 @@ PINNED_MODELS_RAW = [s.strip() for s in PINNED_MODELS_ENV.split(",") if s.strip(
 
 # 声明可用模型（用于白名单 & 类型标注）
 MODEL_SPECS: Dict[str, Dict] = {
-    "bge-m3": {"type": "text"},
-    "bge-vl": {"type": "vl"},
-    # ---- Qwen3 Embedding 兼容别名 ----
-    "qwen": {"type": "text"},
-    "qwen-embedding": {"type": "text"},
-    "qwen3-embedding": {"type": "text"},
-    "qwen3-embedding-0.6b": {"type": "text"},
-    "qwen/qwen3-embedding-0.6b": {"type": "text"},
+    "bge-m3": {"type": "text", "model_id": "BAAI/bge-m3", "source": "ms"},
+    "bge-vl": {"type": "vl", "model_id": "BAAI/bge-vl-large", "source": "ms"},
+    # ---- Qwen3 Embedding ----
+    "qwen": {"type": "text", "model_id": "Qwen/Qwen3-Embedding-0.6B", "source": "ms"},
+    "qwen-embedding": {"type": "text", "model_id": "Qwen/Qwen3-Embedding-0.6B", "source": "ms"},
+    "qwen3-embedding": {"type": "text", "model_id": "Qwen/Qwen3-Embedding-0.6B", "source": "ms"},
+    "qwen3-embedding-0.6b": {"type": "text", "model_id": "Qwen/Qwen3-Embedding-0.6B", "source": "ms"},
+    "qwen/qwen3-embedding-0.6b": {"type": "text", "model_id": "Qwen/Qwen3-Embedding-0.6B", "source": "ms"},
     # ---- SigLip2 family (transformers) ----
-    "siglip2-base-patch16-224": {"type": "vl"},
-    "siglip2-base-patch16-256": {"type": "vl"},
-    "siglip2-base-patch16-384": {"type": "vl"},
-    "siglip2-base-patch16-512": {"type": "vl"},
-    "siglip2-large-patch16-256": {"type": "vl"},
-    "siglip2-large-patch16-384": {"type": "vl"},
-    "siglip2-large-patch16-512": {"type": "vl"},
-    # ---- open_clip pretrained local-dir ----
+    "siglip2-base-patch16-224": {"type": "vl", "model_id": "google/siglip2-base-patch16-224", "source": "hf"},
+    "siglip2-base-patch16-256": {"type": "vl", "model_id": "google/siglip2-base-patch16-256", "source": "hf"},
+    "siglip2-base-patch16-384": {"type": "vl", "model_id": "google/siglip2-base-patch16-384", "source": "hf"},
+    "siglip2-base-patch16-512": {"type": "vl", "model_id": "google/siglip2-base-patch16-512", "source": "hf"},
+    "siglip2-large-patch16-256": {"type": "vl", "model_id": "google/siglip2-large-patch16-256", "source": "hf"},
+    "siglip2-large-patch16-384": {"type": "vl", "model_id": "google/siglip2-large-patch16-384", "source": "hf"},
+    "siglip2-large-patch16-512": {"type": "vl", "model_id": "google/siglip2-large-patch16-512", "source": "hf"},
+    # ---- open_clip (model_id 为空，走本地目录) ----
     "openclip-siglip2-vit-b-16": {"type": "vl"},
     "openclip-vit-b-16-siglip2": {"type": "vl"},
     "vit-b-16-siglip2": {"type": "vl"},
-    "baai/bge-vl-large": {"type": "vl"},
-
-    # ---- Immich ONNX SigLIP2 (ViT-B-16-SigLIP2__webli) ----
-    "immich-vit-b-16-siglip2__webli": {"type": "vl"},
-    "vit-b-16-siglip2__webli": {"type": "vl"},
-    "immich-app/vit-b-16-siglip2__webli": {"type": "vl"},
-    "immich-app/vit-b-16-siglip2__webli@onnx": {"type": "vl"},
+    "baai/bge-vl-large": {"type": "vl", "model_id": "BAAI/bge-vl-large", "source": "ms"},
+    # ---- Immich ONNX ----
+    "immich-vit-b-16-siglip2__webli": {"type": "vl", "model_id": "immich-app/ViT-B-16-SigLIP2__webli", "source": "hf"},
+    "vit-b-16-siglip2__webli": {"type": "vl", "model_id": "immich-app/ViT-B-16-SigLIP2__webli", "source": "hf"},
+    "immich-app/vit-b-16-siglip2__webli": {"type": "vl", "model_id": "immich-app/ViT-B-16-SigLIP2__webli", "source": "hf"},
+    "immich-app/vit-b-16-siglip2__webli@onnx": {"type": "vl", "model_id": "immich-app/ViT-B-16-SigLIP2__webli", "source": "hf"},
 }
 
 # -------- 状态 --------
@@ -195,6 +194,9 @@ def spawn_worker(model: str) -> Worker:
     env["MODEL_NAME"] = model
     env["PORT"] = str(port)
     env["PINNED"] = "1" if pinned else "0"
+    spec = MODEL_SPECS.get(canonical_model_name(model), {})
+    env["MODEL_ID"] = spec.get("model_id", "")
+    env["MODEL_SOURCE"] = spec.get("source", "")
 
     proc = None
     try:
@@ -462,6 +464,11 @@ def embed(model: str, body: dict = Body(...)):
 @app.get("/ping")
 def ping():
     return PlainTextResponse("pong")
+
+
+@app.get("/health")
+def health():
+    return PlainTextResponse("ok")
 
 
 @app.post("/predict")

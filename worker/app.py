@@ -81,6 +81,10 @@ IMMICH_HF_REPO = os.getenv("IMMICH_HF_REPO", "immich-app/ViT-B-16-SigLIP2__webli
 IMMICH_MODEL_DIR = os.getenv("IMMICH_MODEL_DIR", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
+MODEL_HUB_API_URL = os.getenv("MODEL_HUB_API_URL", "").rstrip("/")
+MODEL_ID = os.getenv("MODEL_ID", "").strip()
+MODEL_SOURCE = os.getenv("MODEL_SOURCE", "").strip()
+
 # -------- Caches --------
 _model = None
 _processor = None
@@ -230,28 +234,16 @@ def _hf_or_local_immich_dir() -> str:
     if IMMICH_MODEL_DIR and os.path.isdir(IMMICH_MODEL_DIR):
         return IMMICH_MODEL_DIR
 
+    # MODEL_ROOT 下候选
     cand = os.path.join(MODEL_ROOT, "ViT-B-16-SigLIP2__webli")
     if os.path.isdir(cand):
         return cand
-
     cand2 = os.path.join(MODEL_ROOT, IMMICH_HF_REPO.split("/")[-1])
     if os.path.isdir(cand2):
         return cand2
 
-    try:
-        from huggingface_hub import snapshot_download
-    except Exception as e:
-        raise RuntimeError(f"huggingface_hub not available: {e}. Install: pip install -U huggingface_hub")
-
-    local_cache = os.path.join(MODEL_ROOT, "hf_cache")
-    os.makedirs(local_cache, exist_ok=True)
-
-    return snapshot_download(
-        repo_id=IMMICH_HF_REPO,
-        cache_dir=local_cache,
-        token=HF_TOKEN or None,
-        allow_patterns=["*.json", "*.onnx", "*tokenizer*", "*preprocess*", "*"],
-    )
+    # 标准缓存 + model-hub 拉取
+    return _resolve_model(MODEL_ID, MODEL_SOURCE, IMMICH_HF_REPO.split("/")[-1])
 
 
 def _pil_resampling_from_str(name: str):
@@ -467,6 +459,118 @@ def _get_immich_clip_entry(entries: Dict[str, Any]) -> tuple[str, Dict[str, Any]
     return modality, entry
 
 
+# -------- Cache helpers --------
+def _get_hf_cache_dirs() -> list[str]:
+    """HF hub cache 目录列表，按优先级排列。"""
+    dirs: list[str] = []
+    env = os.getenv("HF_HUB_CACHE") or (os.path.join(os.getenv("HF_HOME", ""), "hub") if os.getenv("HF_HOME") else "")
+    if env:
+        dirs.append(env)
+    dirs.append(os.path.expanduser("~/.cache/huggingface/hub"))
+    return dirs
+
+
+def _get_ms_cache_dirs() -> list[str]:
+    """ModelScope cache 目录列表，按优先级排列。"""
+    dirs: list[str] = []
+    env = os.getenv("MODELSCOPE_CACHE", "")
+    if env:
+        dirs.append(env)
+    dirs.append(os.path.expanduser("~/.cache/modelscope/hub"))
+    return dirs
+
+
+def _find_in_hf_cache(model_id: str) -> str | None:
+    """在 HF hub 缓存中查找模型，返回最新的 snapshot 路径。"""
+    for root in _get_hf_cache_dirs():
+        safe = model_id.replace("/", "--")
+        snapshots = os.path.join(root, f"models--{safe}", "snapshots")
+        if os.path.isdir(snapshots):
+            snaps = sorted(os.listdir(snapshots))
+            if snaps:
+                return os.path.join(snapshots, snaps[-1])
+    return None
+
+
+def _find_in_ms_cache(model_id: str) -> str | None:
+    """在 ModelScope 缓存中查找模型（扫描实际目录，处理 .→___ 等命名差异）。"""
+    for root in _get_ms_cache_dirs():
+        safe = model_id.replace("/", "--")
+        model_dir = os.path.join(root, f"models--{safe}")
+        if not os.path.isdir(model_dir):
+            continue
+        parts = model_id.split("/")
+        if len(parts) != 2:
+            continue
+        org_dir = os.path.join(model_dir, parts[0])
+        if not os.path.isdir(org_dir):
+            continue
+        # 扫描 org 下的子目录，找包含模型文件的
+        for entry in os.listdir(org_dir):
+            candidate = os.path.join(org_dir, entry)
+            if not os.path.isdir(candidate):
+                continue
+            # 检查是否包含模型特征文件
+            if os.path.isfile(os.path.join(candidate, "config.json")):
+                return candidate
+    return None
+
+
+def _find_model_in_cache(model_id: str) -> str | None:
+    """依次在 MS/HF 标准缓存中查找模型。"""
+    p = _find_in_ms_cache(model_id)
+    if p:
+        return p
+    p = _find_in_hf_cache(model_id)
+    if p:
+        return p
+    return None
+
+
+def _pull_model_from_hub(model_id: str, source: str, name: str = "", timeout: int = 600) -> None:
+    """调用 model-hub API 拉取模型并等待完成。"""
+    if not MODEL_HUB_API_URL:
+        raise RuntimeError("MODEL_HUB_API_URL not set, cannot pull model")
+    import time
+    url = f"{MODEL_HUB_API_URL}/api/v1/models/pull"
+    resp = requests.post(url, json={
+        "model_id": f"{source}://{model_id}",
+        "source": source,
+        "name": name or model_id.split("/")[-1],
+    }, timeout=30)
+    resp.raise_for_status()
+    task_id = resp.json()["task_id"]
+    status_url = f"{MODEL_HUB_API_URL}/api/v1/tasks/detail/{task_id}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = requests.get(status_url, timeout=10)
+        r.raise_for_status()
+        phase = r.json().get("phase", "")
+        if phase == "READY":
+            return
+        if phase == "FAILED":
+            raise RuntimeError(f"Model pull failed: {r.json().get('error_msg', 'unknown error')}")
+        time.sleep(3)
+    raise RuntimeError(f"Model pull timed out after {timeout}s for {model_id}")
+
+
+def _resolve_model(model_id: str, source: str, name: str = "") -> str:
+    """通用：检查缓存 → 调 API 拉取 → 返回本地路径或报错。"""
+    path = _find_model_in_cache(model_id)
+    if path:
+        return path
+    if MODEL_HUB_API_URL:
+        print(f"[{name or model_id}] not in cache, pulling from model-hub...", flush=True)
+        try:
+            _pull_model_from_hub(model_id, source, name or model_id.split("/")[-1])
+            path = _find_model_in_cache(model_id)
+            if path:
+                return path
+        except Exception as e:
+            print(f"[{name or model_id}] pull failed: {e}", flush=True)
+    raise RuntimeError(f"Model {model_id} not found in cache and could not be pulled")
+
+
 # -------- Load models --------
 def load_model():
     global _model, _processor, _openclip_preprocess, _openclip_tokenizer
@@ -489,8 +593,7 @@ def load_model():
 
         if name in ["bge-m3", "baai/bge-m3"]:
             from FlagEmbedding import BGEM3FlagModel
-            local_path = os.path.join(MODEL_ROOT, "bge-m3")
-            resolved = local_path if os.path.isdir(local_path) else MODEL_NAME
+            resolved = _resolve_model(MODEL_ID, MODEL_SOURCE)
             _model = BGEM3FlagModel(resolved, use_fp16=False)
             try:
                 if torch.cuda.is_available() and hasattr(_model, "model"):
@@ -501,15 +604,7 @@ def load_model():
 
         if name in ["bge-vl", "baai/bge-vl", "baai/bge-vl-base", "baai/bge-vl-large"]:
             from transformers import AutoModel
-            base_path = os.path.join(MODEL_ROOT, "BGE-VL-base")
-            large_path = os.path.join(MODEL_ROOT, "BGE-VL-large")
-            mapping = {
-                "bge-vl": base_path,
-                "baai/bge-vl": base_path,
-                "baai/bge-vl-base": base_path,
-                "baai/bge-vl-large": large_path,
-            }
-            resolved = mapping.get(name, MODEL_NAME)
+            resolved = _resolve_model(MODEL_ID, MODEL_SOURCE)
             target_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
             _model = AutoModel.from_pretrained(resolved, trust_remote_code=True, dtype=target_dtype)
             _model.set_processor(resolved)
@@ -522,8 +617,7 @@ def load_model():
             "qwen/qwen3-embedding-0.6b", "qwen3-embedding-0.6b"
         ]:
             from sentence_transformers import SentenceTransformer
-            local_path = os.path.join(MODEL_ROOT, "Qwen3-Embedding-0.6B")
-            resolved = local_path if os.path.isdir(local_path) else MODEL_NAME
+            resolved = _resolve_model(MODEL_ID, MODEL_SOURCE, "qwen3-embedding-0.6b")
             _model = SentenceTransformer(resolved)
             return
 
@@ -552,23 +646,17 @@ def load_model():
 
         if name.startswith("siglip2-"):
             from transformers import AutoModel, AutoProcessor
-            local_dir = os.path.join(MODEL_ROOT, MODEL_NAME)
-            if os.path.isdir(local_dir):
-                model_id = local_dir
-                processor_id = local_dir
-            else:
-                model_id = f"google/{MODEL_NAME}"
-                processor_id = model_id
+            resolved = _resolve_model(MODEL_ID, MODEL_SOURCE, MODEL_NAME)
 
             if torch.cuda.is_available():
                 target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             else:
                 target_dtype = torch.float32
 
-            _model = AutoModel.from_pretrained(model_id, torch_dtype=target_dtype, device_map=None)
+            _model = AutoModel.from_pretrained(resolved, torch_dtype=target_dtype, device_map=None)
             _model.to(DEVICE, dtype=target_dtype)
             _model.eval()
-            _processor = AutoProcessor.from_pretrained(processor_id)
+            _processor = AutoProcessor.from_pretrained(resolved)
             return
 
         raise RuntimeError(f"Unknown MODEL_NAME={MODEL_NAME}")
@@ -688,7 +776,8 @@ def embed(body: Dict[str, Any] = Body(...)):
             raise HTTPException(400, f"invalid body for bge-m3: {e}")
         try:
             with torch.inference_mode():
-                res = _model.encode(args.input, batch_size=args.batch, max_length=args.max_length)
+                res = _model.encode(args.input, batch_size=args.batch, max_length=args.max_length,
+                                    return_dense=True, return_sparse=True, return_colbert_vecs=False)
                 out = res["dense_vecs"]
                 if args.normalize:
                     import torch.nn.functional as F
@@ -698,7 +787,19 @@ def embed(body: Dict[str, Any] = Body(...)):
             import traceback
             raise HTTPException(500, f"bge-m3 encode failed: {e}\n{traceback.format_exc()}")
         out = _to_list(out)
-        return {"embeddings": out, "dim": (len(out[0]) if out else 0), "model": MODEL_NAME, "modality": "text"}
+        # 稀疏向量：{token_id: weight}
+        lexical = []
+        lw = res.get("lexical_weights")
+        if lw is not None:
+            for w in lw:
+                lexical.append({str(k): float(v) for k, v in w.items()})
+        return {
+            "embeddings": out,
+            "lexical_weights": lexical,
+            "dim": (len(out[0]) if out else 0),
+            "model": MODEL_NAME,
+            "modality": "text",
+        }
 
     # ---------- qwen3-embedding ----------
     if name in [
@@ -857,6 +958,15 @@ def embed(body: Dict[str, Any] = Body(...)):
                     tmp_files.append(img_ref)
                 elif item.image_url and _is_data_url(item.image_url):
                     img_ref = _save_data_url_to_tmp(item.image_url)
+                    tmp_files.append(img_ref)
+                elif item.image_url and (item.image_url.startswith("http://") or item.image_url.startswith("https://")):
+                    # 下载远程图片到临时文件
+                    resp = requests.get(item.image_url, timeout=15)
+                    resp.raise_for_status()
+                    suffix = ".jpg"
+                    fd, img_ref = tempfile.mkstemp(prefix="img_", suffix=suffix)
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(resp.content)
                     tmp_files.append(img_ref)
                 else:
                     img_ref = item.image_url or item.image_path
