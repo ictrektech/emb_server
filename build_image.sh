@@ -185,15 +185,16 @@ find_component_column_letter() {
   local spreadsheet_token="$2"
   local sheet_id="$3"
   local component_name="$4"
-  local resp
+  local resp result status value cell resp2 meta_resp column_count
 
-  resp=$(get_range_values "$token" "$spreadsheet_token" "${sheet_id}!A1:AZ1") || {
+  resp=$(get_range_values "$token" "$spreadsheet_token" "${sheet_id}!A1:ZZ2") || {
     err "find_component_column_letter: read range failed"
     return 1
   }
 
-  python3 - "$component_name" "$resp" <<'PY'
+  result=$(python3 - "$component_name" "$resp" <<'PYFIND'
 import sys, json
+
 target = sys.argv[1]
 resp = sys.argv[2]
 if not resp:
@@ -205,18 +206,113 @@ except Exception as e:
 if data.get("code") != 0:
     raise SystemExit(f"read header failed: {data}")
 values = data.get("data", {}).get("valueRange", {}).get("values", [])
-row = values[0] if values else []
-for i, v in enumerate(row, start=1):
-    if str(v).strip() == target:
-        n = i
-        s = ""
-        while n > 0:
-            n, r = divmod(n - 1, 26)
-            s = chr(ord("A") + r) + s
-        print(s)
+rows = values[:2]
+header = rows[0] if rows else []
+repo = rows[1] if len(rows) > 1 else []
+
+def text(v):
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, dict):
+        return str(v.get("text") or v.get("link") or "").strip()
+    if isinstance(v, list):
+        return "".join(text(x) for x in v).strip()
+    return str(v).strip()
+
+def col(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(ord("A") + r) + s
+    return s
+
+for i, v in enumerate(header, start=1):
+    if text(v) == target:
+        print(f"FOUND\t{col(i)}")
         raise SystemExit(0)
-raise SystemExit(f"component column not found in row1: {target}")
-PY
+
+last = 1
+for row in (header, repo):
+    for i, v in enumerate(row, start=1):
+        if text(v):
+            last = max(last, i)
+print(f"MISSING\t{last}")
+PYFIND
+  )
+
+  status="${result%%$'\t'*}"
+  value="${result#*$'\t'}"
+  if [[ "$status" == "FOUND" ]]; then
+    echo "$value"
+    return 0
+  fi
+  if [[ "$status" != "MISSING" ]]; then
+    err "find_component_column_letter: unexpected result: $result"
+    return 1
+  fi
+
+  meta_resp=$(feishu_api_json "GET" \
+    "https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/${spreadsheet_token}/sheets/query" \
+    "$token") || {
+    err "query sheet metadata failed"
+    return 1
+  }
+
+  column_count=$(python3 - "$sheet_id" "$meta_resp" <<'PYSHEET'
+import json, sys
+sheet_id, resp = sys.argv[1], sys.argv[2]
+data = json.loads(resp)
+if data.get("code") != 0:
+    raise SystemExit(f"query sheets failed: {data}")
+for sheet in data.get("data", {}).get("sheets", []):
+    if sheet.get("sheet_id") == sheet_id:
+        print(sheet.get("grid_properties", {}).get("column_count", 0))
+        raise SystemExit(0)
+raise SystemExit(f"sheet id not found: {sheet_id}")
+PYSHEET
+  )
+
+  if (( value >= column_count )); then
+    resp2=$(feishu_api_json "POST" \
+      "https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/${spreadsheet_token}/dimension_range" \
+      "$token" \
+      "{\"dimension\":{\"sheetId\":\"${sheet_id}\",\"majorDimension\":\"COLUMNS\",\"length\":1}}") || {
+      err "append component column failed"
+      return 1
+    }
+  else
+    resp2=$(feishu_api_json "POST" \
+      "https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/${spreadsheet_token}/insert_dimension_range" \
+      "$token" \
+      "{\"dimension\":{\"sheetId\":\"${sheet_id}\",\"majorDimension\":\"COLUMNS\",\"startIndex\":${value},\"endIndex\":$((value + 1))},\"inheritStyle\":\"BEFORE\"}") || {
+      err "insert component column failed"
+      return 1
+    }
+  fi
+
+  python3 - "$resp2" <<'PYCHECK'
+import json, sys
+resp = sys.argv[1]
+data = json.loads(resp)
+if data.get("code") != 0:
+    raise SystemExit(f"add component column failed: {data}")
+PYCHECK
+
+  cell=$(python3 - "$value" <<'PYCOL'
+import sys
+n = int(sys.argv[1]) + 1
+s = ""
+while n > 0:
+    n, r = divmod(n - 1, 26)
+    s = chr(ord("A") + r) + s
+print(s)
+PYCOL
+  )
+
+  write_cell "$token" "$spreadsheet_token" "$sheet_id" "${cell}1" "$component_name" >/dev/null
+  echo "$cell"
 }
 
 find_date_row() {
