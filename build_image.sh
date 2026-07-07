@@ -489,6 +489,9 @@ log "TARGET_SHEET_TITLE=${TARGET_SHEET_TITLE}"
 log "IMG_NAME=${IMG_NAME}"
 log "TAG=${TAG}"
 
+export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-0}"
+log "DOCKER_BUILDKIT=${DOCKER_BUILDKIT}"
+
 docker build \
   "${BUILD_ARGS[@]}" \
   -t "${IMG_NAME}" \

@@ -96,6 +96,14 @@ swr.cn-southwest-2.myhuaweicloud.com/ictrek/emb_server:<PROFILE_TAG>_<VERSION>_<
 docker compose -f dc.yml up
 ```
 
+### 构建镜像
+
+```bash
+./build_image.sh --profile Dockerfile_thor
+```
+
+`build_image.sh` 默认使用 `DOCKER_BUILDKIT=0` 构建，避免当前 SWR registry 拒绝 BuildKit manifest。
+
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -143,6 +151,8 @@ curl http://127.0.0.1:18000/metrics
 
 `/ping` 返回 `pong`，用于 Immich Machine Learning URL 健康检查；`/metrics` 返回已加载 worker、常驻模型和并发状态。
 
+常驻模型只预热 1 个 worker。bge-m3 在单个模型实例内处理请求；并发请求会排队复用同一份 GPU 模型，避免多副本加载占满显存。需要吞吐时优先把多条文本放在同一个 `input` 数组里批量编码。
+
 ### 通用文本 embedding
 
 ```bash
@@ -161,6 +171,18 @@ curl -X POST 'http://127.0.0.1:18000/embed?model=bge-m3' \
   "modality": "text"
 }
 ```
+
+### OpenAI embedding 兼容接口
+
+`/v1/embeddings` 和 `/embeddings` 可用于 OpenAI embedding API 调用方：
+
+```bash
+curl -X POST 'http://127.0.0.1:18000/v1/embeddings' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"bge-m3","input":["hello world"],"encoding_format":"float","truncate_prompt_tokens":8192}'
+```
+
+返回字段为 OpenAI 兼容的 `data[].embedding`。
 
 ### Qwen3 embedding
 

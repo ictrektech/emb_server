@@ -98,6 +98,7 @@ _immich_preprocess = None
 _immich_context_len = None
 
 _start_lock = threading.Lock()
+_encode_lock = threading.Lock()
 
 # -------- Schemas --------
 class TextBatch(BaseModel):
@@ -775,7 +776,8 @@ def embed(body: Dict[str, Any] = Body(...)):
         except Exception as e:
             raise HTTPException(400, f"invalid body for bge-m3: {e}")
         try:
-            with torch.inference_mode():
+            # ponytail: one loaded model instance; concurrent requests queue here instead of duplicating GPU memory.
+            with _encode_lock, torch.inference_mode():
                 res = _model.encode(args.input, batch_size=args.batch, max_length=args.max_length,
                                     return_dense=True, return_sparse=True, return_colbert_vecs=False)
                 out = res["dense_vecs"]

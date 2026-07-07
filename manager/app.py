@@ -82,6 +82,8 @@ def canonical_model_name(model: str) -> str:
     将多个别名统一到一个 canonical key，避免同一个模型因为不同字符串被当成多个模型启动多份 worker。
     """
     m = (model or "").strip().lower()
+    if m.endswith(":latest"):
+        m = m[:-7]
     alias = {
         # immich onnx
         "immich-vit-b-16-siglip2__webli": "vit-b-16-siglip2__webli",
@@ -459,6 +461,44 @@ def embed(model: str, body: dict = Body(...)):
         return r.json()
     finally:
         w.inflight -= 1
+
+
+def _openai_embeddings(body: dict):
+    model = canonical_model_name(str(body.get("model", "bge-m3")))
+    raw_input = body.get("input", [])
+    if isinstance(raw_input, str):
+        raw_input = [raw_input]
+    if not isinstance(raw_input, list):
+        raise HTTPException(400, "input must be a string or list")
+
+    forwarded = {
+        "input": raw_input,
+        "normalize": bool(body.get("normalize", True)),
+    }
+    if body.get("truncate_prompt_tokens"):
+        forwarded["max_length"] = body["truncate_prompt_tokens"]
+
+    result = embed(model=model, body=forwarded)
+    embeddings = result.get("embeddings", [])
+    return {
+        "object": "list",
+        "model": model,
+        "data": [
+            {"object": "embedding", "embedding": emb, "index": index}
+            for index, emb in enumerate(embeddings)
+        ],
+        "usage": {"prompt_tokens": 0, "total_tokens": 0},
+    }
+
+
+@app.post("/v1/embeddings")
+def openai_embeddings_v1(body: dict = Body(...)):
+    return _openai_embeddings(body)
+
+
+@app.post("/embeddings")
+def openai_embeddings(body: dict = Body(...)):
+    return _openai_embeddings(body)
 
 
 @app.get("/ping")
